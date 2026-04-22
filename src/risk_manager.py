@@ -3,12 +3,21 @@
 All safety guards are enforced here, independent of LLM decisions.
 The LLM cannot override these limits — they are hard-coded checks
 applied before every trade execution.
+
+Changes from original:
+- enforce_stop_loss validates SL is on the CORRECT side of entry
+- enforce_take_profit validates TP is on the CORRECT side of entry
+- Circuit breaker state persisted across restarts via risk_state.json
+- Leverage check uses correct semantics (position notional / account equity)
+- check_losing_positions handles both position dict formats
 """
 
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from src.config_loader import CONFIG
+from src.utils.state_persistence import load_risk_state, save_risk_state
 
 
 class RiskManager:
@@ -25,13 +34,35 @@ class RiskManager:
         self.max_concurrent_positions = int(CONFIG.get("max_concurrent_positions") or 10)
         self.min_balance_reserve_pct = float(CONFIG.get("min_balance_reserve_pct") or 20)
 
-        # Daily tracking
-        self.daily_high_value = None
-        self.daily_high_date = None
+        # Daily tracking — load persisted state so restarts don't reset the breaker
         self.circuit_breaker_active = False
+        self.daily_high_value: float | None = None
+        self.daily_high_date = None
         self.circuit_breaker_date = None
+        self._load_persisted_state()
 
-    def _reset_daily_if_needed(self, account_value: float):
+    def _load_persisted_state(self) -> None:
+        state = load_risk_state()
+        if state:
+            self.circuit_breaker_active = bool(state.get("circuit_breaker_active", False))
+            self.daily_high_value = state.get("daily_high_value")
+            today = datetime.now(timezone.utc).date()
+            self.daily_high_date = today
+            if self.circuit_breaker_active:
+                logging.warning(
+                    "RISK: Circuit breaker WAS active when bot last stopped. "
+                    "It remains active for today (%s).",
+                    today,
+                )
+
+    def _persist_state(self) -> None:
+        save_risk_state({
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "circuit_breaker_active": self.circuit_breaker_active,
+            "daily_high_value": self.daily_high_value,
+        })
+
+    def _reset_daily_if_needed(self, account_value: float) -> None:
         """Reset daily high watermark at UTC day boundary."""
         today = datetime.now(timezone.utc).date()
         if self.daily_high_date != today:
@@ -39,8 +70,10 @@ class RiskManager:
             self.daily_high_date = today
             self.circuit_breaker_active = False
             self.circuit_breaker_date = None
-        elif account_value > self.daily_high_value:
+            self._persist_state()
+        elif self.daily_high_value is None or account_value > self.daily_high_value:
             self.daily_high_value = account_value
+            self._persist_state()
 
     # ------------------------------------------------------------------
     # Individual checks — each returns (allowed: bool, reason: str)
@@ -58,8 +91,9 @@ class RiskManager:
             )
         return True, ""
 
-    def check_total_exposure(self, positions: list[dict], new_alloc: float,
-                              account_value: float) -> tuple[bool, str]:
+    def check_total_exposure(
+        self, positions: list[dict], new_alloc: float, account_value: float
+    ) -> tuple[bool, str]:
         """Sum of all position notionals + new allocation cannot exceed max_total_exposure_pct."""
         current_exposure = 0.0
         for pos in positions:
@@ -75,14 +109,22 @@ class RiskManager:
             )
         return True, ""
 
-    def check_leverage(self, alloc_usd: float, balance: float) -> tuple[bool, str]:
-        """Effective leverage of new trade cannot exceed max_leverage."""
-        if balance <= 0:
-            return False, "Balance is zero or negative"
-        effective_lev = alloc_usd / balance
-        if effective_lev > self.max_leverage:
+    def check_leverage(self, alloc_usd: float, account_value: float) -> tuple[bool, str]:
+        """Check that the notional exposure relative to account equity is within limits.
+
+        Hyperliquid leverage is enforced at the position level by the exchange.
+        This check prevents the bot from sizing a position so large that the
+        implicit leverage (notional / account_value) exceeds our configured max.
+        """
+        if account_value <= 0:
+            return False, "Account value is zero or negative"
+        # alloc_usd here is NOTIONAL exposure, account_value is total equity
+        implicit_leverage = alloc_usd / account_value
+        if implicit_leverage > self.max_leverage:
             return False, (
-                f"Effective leverage {effective_lev:.1f}x exceeds max {self.max_leverage}x"
+                f"Implicit leverage {implicit_leverage:.1f}x "
+                f"(notional ${alloc_usd:.2f} / equity ${account_value:.2f}) "
+                f"exceeds max {self.max_leverage}x"
             )
         return True, ""
 
@@ -92,10 +134,13 @@ class RiskManager:
         if self.circuit_breaker_active:
             return False, "Daily loss circuit breaker is active — no new trades until tomorrow (UTC)"
         if self.daily_high_value and self.daily_high_value > 0:
-            drawdown_pct = ((self.daily_high_value - account_value) / self.daily_high_value) * 100
+            drawdown_pct = (
+                (self.daily_high_value - account_value) / self.daily_high_value * 100
+            )
             if drawdown_pct >= self.daily_loss_circuit_breaker_pct:
                 self.circuit_breaker_active = True
                 self.circuit_breaker_date = datetime.now(timezone.utc).date()
+                self._persist_state()
                 return False, (
                     f"Daily drawdown {drawdown_pct:.2f}% exceeds circuit breaker "
                     f"threshold of {self.daily_loss_circuit_breaker_pct}%"
@@ -110,15 +155,19 @@ class RiskManager:
             )
         return True, ""
 
-    def check_balance_reserve(self, balance: float, initial_balance: float) -> tuple[bool, str]:
-        """Don't trade if balance falls below reserve threshold."""
-        if initial_balance <= 0:
+    def check_balance_reserve(self, balance: float, account_value: float) -> tuple[bool, str]:
+        """Don't trade if balance falls below reserve threshold of CURRENT account value.
+
+        Uses current account_value (not a stale initial snapshot) so the reserve
+        scales with account size rather than anchoring to a potentially outdated figure.
+        """
+        if account_value <= 0:
             return True, ""
-        min_balance = initial_balance * (self.min_balance_reserve_pct / 100.0)
+        min_balance = account_value * (self.min_balance_reserve_pct / 100.0)
         if balance < min_balance:
             return False, (
-                f"Balance ${balance:.2f} below minimum reserve "
-                f"${min_balance:.2f} ({self.min_balance_reserve_pct}% of initial)"
+                f"Available balance ${balance:.2f} below minimum reserve "
+                f"${min_balance:.2f} ({self.min_balance_reserve_pct}% of account value)"
             )
         return True, ""
 
@@ -135,8 +184,13 @@ class RiskManager:
         """Clamp strategy-provided leverage to the configured safety range."""
         if leverage is None:
             return 1.0
+        try:
+            leverage = float(leverage)
+        except (TypeError, ValueError):
+            logging.warning("RISK: Non-numeric leverage value; forcing 1x")
+            return 1.0
         if leverage < 1.0:
-            logging.warning("RISK: leverage %.2f is below 1x; forcing 1x", leverage)
+            logging.warning("RISK: leverage %.2f below 1x; forcing 1x", leverage)
             return 1.0
         if leverage > self.max_leverage:
             logging.warning(
@@ -148,38 +202,100 @@ class RiskManager:
         return float(leverage)
 
     # ------------------------------------------------------------------
-    # Stop-loss enforcement
+    # Stop-loss and take-profit enforcement
     # ------------------------------------------------------------------
 
-    def enforce_stop_loss(self, sl_price: float | None, entry_price: float,
-                           is_buy: bool) -> float:
-        """Ensure every trade has a stop-loss. Auto-set if missing."""
-        if sl_price is not None:
-            return sl_price
-        # Auto-set SL at mandatory_sl_pct from entry
+    def enforce_stop_loss(
+        self, sl_price: float | None, entry_price: float, is_buy: bool
+    ) -> float:
+        """Ensure every trade has a valid stop-loss on the CORRECT side.
+
+        Validates provided SL. If missing or invalid (wrong side, absurdly close),
+        auto-sets at mandatory_sl_pct from entry.
+        """
         sl_distance = entry_price * (self.mandatory_sl_pct / 100.0)
-        if is_buy:
-            return round(entry_price - sl_distance, 2)
-        else:
-            return round(entry_price + sl_distance, 2)
+        auto_sl = (
+            round(entry_price - sl_distance, 8)
+            if is_buy
+            else round(entry_price + sl_distance, 8)
+        )
+
+        if sl_price is None:
+            logging.info(
+                "RISK: No SL provided; auto-setting at %.6f (%.1f%% from entry)",
+                auto_sl, self.mandatory_sl_pct,
+            )
+            return auto_sl
+
+        try:
+            sl_price = float(sl_price)
+        except (TypeError, ValueError):
+            logging.warning("RISK: Non-numeric SL; using auto SL %.6f", auto_sl)
+            return auto_sl
+
+        # SL must be on the losing side
+        if is_buy and sl_price >= entry_price:
+            logging.warning(
+                "RISK: SL %.6f >= entry %.6f for BUY — INVALID; using auto SL %.6f",
+                sl_price, entry_price, auto_sl,
+            )
+            return auto_sl
+        if not is_buy and sl_price <= entry_price:
+            logging.warning(
+                "RISK: SL %.6f <= entry %.6f for SELL — INVALID; using auto SL %.6f",
+                sl_price, entry_price, auto_sl,
+            )
+            return auto_sl
+
+        # SL must not be so tight it fires immediately on spread (< 0.01% from entry)
+        min_distance = entry_price * 0.0001
+        actual_distance = abs(entry_price - sl_price)
+        if actual_distance < min_distance:
+            logging.warning(
+                "RISK: SL %.6f too close to entry %.6f (%.4f%%); using auto SL",
+                sl_price, entry_price, actual_distance / entry_price * 100,
+            )
+            return auto_sl
+
+        return round(sl_price, 8)
+
+    def enforce_take_profit(
+        self, tp_price: float | None, entry_price: float, is_buy: bool
+    ) -> float | None:
+        """Validate TP is on the profitable side. Returns None if invalid (clears TP)."""
+        if tp_price is None:
+            return None
+
+        try:
+            tp_price = float(tp_price)
+        except (TypeError, ValueError):
+            logging.warning("RISK: Non-numeric TP; clearing TP")
+            return None
+
+        if is_buy and tp_price <= entry_price:
+            logging.warning(
+                "RISK: TP %.6f <= entry %.6f for BUY — INVALID; clearing TP",
+                tp_price, entry_price,
+            )
+            return None
+        if not is_buy and tp_price >= entry_price:
+            logging.warning(
+                "RISK: TP %.6f >= entry %.6f for SELL — INVALID; clearing TP",
+                tp_price, entry_price,
+            )
+            return None
+
+        return round(tp_price, 8)
 
     # ------------------------------------------------------------------
     # Force-close losing positions
     # ------------------------------------------------------------------
 
     def check_losing_positions(self, positions: list[dict]) -> list[dict]:
-        """Return positions that should be force-closed due to excessive loss.
-
-        Args:
-            positions: List of position dicts with keys:
-                coin/symbol, szi/quantity, entryPx/entry_price,
-                pnl/unrealized_pnl
-
-        Returns:
-            List of positions that exceed the max loss threshold.
-        """
+        """Return positions that should be force-closed due to excessive loss."""
         to_close = []
         for pos in positions:
+            # Handle both raw SDK format (szi/entryPx) and normalized format
             coin = pos.get("coin") or pos.get("symbol")
             entry_px = float(pos.get("entryPx") or pos.get("entry_price") or 0)
             size = float(pos.get("szi") or pos.get("quantity") or 0)
@@ -192,12 +308,12 @@ class RiskManager:
             if notional == 0:
                 continue
 
-            loss_pct = abs(pnl / notional) * 100 if pnl < 0 else 0
+            loss_pct = abs(pnl / notional) * 100 if pnl < 0 else 0.0
 
             if loss_pct >= self.max_loss_per_position_pct:
                 logging.warning(
                     "RISK: Force-closing %s — loss %.2f%% exceeds max %.2f%%",
-                    coin, loss_pct, self.max_loss_per_position_pct
+                    coin, loss_pct, self.max_loss_per_position_pct,
                 )
                 to_close.append({
                     "coin": coin,
@@ -212,53 +328,51 @@ class RiskManager:
     # Composite validation — run all checks before a trade
     # ------------------------------------------------------------------
 
-    def validate_trade(self, trade: dict, account_state: dict,
-                        initial_balance: float) -> tuple[bool, str, dict]:
+    def validate_trade(
+        self,
+        trade: dict,
+        account_state: dict,
+        _initial_balance_unused: float,  # kept for API compat, no longer used
+    ) -> tuple[bool, str, dict]:
         """Run all safety checks on a proposed trade.
 
         Args:
-            trade: LLM trade decision with keys:
+            trade: Decision dict with keys:
                 asset, action, allocation_usd, tp_price, sl_price,
-                confidence, leverage
-            account_state: Current account with keys:
+                confidence, leverage, current_price
+            account_state: Fresh account state with keys:
                 balance, total_value, positions
-            initial_balance: Starting balance for reserve check
+            _initial_balance_unused: Deprecated parameter, ignored.
 
         Returns:
             (allowed, reason, adjusted_trade)
-            adjusted_trade may have modified sl_price if it was missing.
         """
         action = trade.get("action", "hold")
         if action == "hold":
             return True, "", trade
 
+        # --- Confidence check ---
         raw_conf = trade.get("confidence")
-        confidence = None
-        try:
-            if raw_conf is not None:
+        confidence: float | None = None
+        if raw_conf is not None:
+            try:
                 confidence = max(0.0, min(1.0, float(raw_conf)))
-        except (TypeError, ValueError):
-            confidence = None
+            except (TypeError, ValueError):
+                confidence = None
         if confidence is not None:
             trade = {**trade, "confidence": round(confidence, 4)}
             ok, reason = self.check_trade_confidence(confidence)
             if not ok:
                 return False, reason, trade
 
-        raw_lev = trade.get("leverage")
-        if raw_lev is None:
-            raw_lev = trade.get("requested_leverage")
-        try:
-            requested_leverage = float(raw_lev) if raw_lev is not None else None
-        except (TypeError, ValueError):
-            requested_leverage = None
-        trade = {**trade, "leverage": self.sanitize_requested_leverage(requested_leverage)}
+        # --- Leverage sanitization ---
+        raw_lev = trade.get("leverage") or trade.get("requested_leverage")
+        trade = {**trade, "leverage": self.sanitize_requested_leverage(raw_lev)}
 
+        # --- Allocation floor ---
         alloc_usd = float(trade.get("allocation_usd", 0))
         if alloc_usd <= 0:
             return False, "Zero or negative allocation", trade
-
-        # Hyperliquid minimum order size is $10
         if alloc_usd < 11.0:
             alloc_usd = 11.0
             trade = {**trade, "allocation_usd": alloc_usd}
@@ -274,20 +388,18 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
-        # 2. Balance reserve
-        ok, reason = self.check_balance_reserve(balance, initial_balance)
+        # 2. Balance reserve (uses current account_value, not stale initial)
+        ok, reason = self.check_balance_reserve(balance, account_value)
         if not ok:
             return False, reason, trade
 
-        # 3. Position size limit
+        # 3. Position size — cap instead of reject
         ok, reason = self.check_position_size(alloc_usd, account_value)
         if not ok:
-            # Cap allocation instead of rejecting
-            max_alloc = account_value * (self.max_position_pct / 100.0)
-            # But never below Hyperliquid's $10 minimum
-            if max_alloc < 11.0:
-                max_alloc = 11.0
-            logging.warning("RISK: Capping allocation from $%.2f to $%.2f", alloc_usd, max_alloc)
+            max_alloc = max(account_value * (self.max_position_pct / 100.0), 11.0)
+            logging.warning(
+                "RISK: Capping allocation from $%.2f to $%.2f", alloc_usd, max_alloc
+            )
             alloc_usd = max_alloc
             trade = {**trade, "allocation_usd": alloc_usd}
 
@@ -296,8 +408,8 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
-        # 5. Leverage check
-        ok, reason = self.check_leverage(alloc_usd, balance)
+        # 5. Implicit leverage (notional vs equity)
+        ok, reason = self.check_leverage(alloc_usd, account_value)
         if not ok:
             return False, reason, trade
 
@@ -310,15 +422,17 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
-        # 7. Enforce mandatory stop-loss
+        # 7. Enforce SL — validate side and auto-set if missing/invalid
         current_price = float(trade.get("current_price", 0))
         entry_price = current_price if current_price > 0 else 1.0
         sl_price = trade.get("sl_price")
-        enforced_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy)
-        if sl_price is None:
-            logging.info("RISK: Auto-setting SL at %.2f (%.1f%% from entry)",
-                        enforced_sl, self.mandatory_sl_pct)
-        trade = {**trade, "sl_price": enforced_sl}
+        validated_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy)
+        trade = {**trade, "sl_price": validated_sl}
+
+        # 8. Enforce TP — validate side; clear if invalid rather than sending wrong order
+        tp_price = trade.get("tp_price")
+        validated_tp = self.enforce_take_profit(tp_price, entry_price, is_buy)
+        trade = {**trade, "tp_price": validated_tp}
 
         return True, "", trade
 

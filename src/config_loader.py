@@ -6,9 +6,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Import AFTER dotenv so the class is available immediately
+from src.utils.security import _SensitiveDict  # noqa: E402
+
 
 def _get_env(name: str, default: str | None = None, required: bool = False) -> str | None:
-    """Fetch an environment variable with optional default and required validation."""
     value = os.getenv(name, default)
     if required and (value is None or value == ""):
         raise RuntimeError(f"Missing required environment variable: {name}")
@@ -16,7 +18,6 @@ def _get_env(name: str, default: str | None = None, required: bool = False) -> s
 
 
 def _get_env_alias(names: list[str], default: str | None = None, required: bool = False) -> str | None:
-    """Fetch the first non-empty env var from a list of names."""
     for name in names:
         value = os.getenv(name)
         if value is not None and value != "":
@@ -71,7 +72,6 @@ def _get_list(name: str, default: list[str] | None = None) -> list[str] | None:
     if raw is None or raw.strip() == "":
         return default
     raw = raw.strip()
-    # Support JSON-style lists
     if raw.startswith("[") and raw.endswith("]"):
         try:
             parsed = json.loads(raw)
@@ -80,7 +80,6 @@ def _get_list(name: str, default: list[str] | None = None) -> list[str] | None:
             return [str(item).strip().strip('"\'') for item in parsed if str(item).strip()]
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Invalid JSON list for {name}: {raw}") from exc
-    # Fallback: comma separated string
     values = []
     for item in raw.split(","):
         cleaned = item.strip().strip('"\'')
@@ -103,20 +102,21 @@ else:
     sanitize_default = llm_model or ""
 
 
-CONFIG = {
+# Use _SensitiveDict so private keys are never printed in tracebacks or logs
+CONFIG = _SensitiveDict({
     # Hyperliquid
     "hyperliquid_private_key": _get_env("HYPERLIQUID_PRIVATE_KEY") or _get_env("LIGHTER_PRIVATE_KEY"),
     "mnemonic": _get_env("MNEMONIC"),
     "hyperliquid_base_url": _get_env("HYPERLIQUID_BASE_URL"),
     "hyperliquid_network": _get_env("HYPERLIQUID_NETWORK", "mainnet"),
-    "hyperliquid_vault_address": _get_env("HYPERLIQUID_VAULT_ADDRESS"),  # Main wallet address (agent signs on behalf)
+    "hyperliquid_vault_address": _get_env("HYPERLIQUID_VAULT_ADDRESS"),
 
     # Execution mode
     "enable_ai_trading": enable_ai_trading,
-    "enable_claude_trading": enable_ai_trading,  # Backward-compatible alias
+    "enable_claude_trading": enable_ai_trading,
     "enable_algo_trading": _get_bool("ENABLE_ALGO_TRADING", False),
     "ai_capital_pct": _get_float("AI_CAPITAL_PCT", _get_float("CLAUDE_CAPITAL_PCT", 100.0)),
-    "claude_capital_pct": _get_float("AI_CAPITAL_PCT", _get_float("CLAUDE_CAPITAL_PCT", 100.0)),  # Alias
+    "claude_capital_pct": _get_float("AI_CAPITAL_PCT", _get_float("CLAUDE_CAPITAL_PCT", 100.0)),
     "algo_capital_pct": _get_float("ALGO_CAPITAL_PCT", 0.0),
     "algo_file_path": _get_env("ALGO_FILE_PATH", "algo.py"),
 
@@ -125,7 +125,7 @@ CONFIG = {
     "llm_model": llm_model,
     "sanitize_model": _get_env_alias(["AI_SANITIZE_MODEL", "SANITIZE_MODEL"], sanitize_default),
 
-    # Provider credentials (required only for selected provider when AI mode is enabled)
+    # Provider credentials
     "anthropic_api_key": _get_env("ANTHROPIC_API_KEY", required=enable_ai_trading and llm_provider == "anthropic"),
     "openai_api_key": _get_env("OPENAI_API_KEY", required=enable_ai_trading and llm_provider == "openai"),
     "gemini_api_key": _get_env("GEMINI_API_KEY", required=enable_ai_trading and llm_provider == "gemini"),
@@ -141,8 +141,8 @@ CONFIG = {
     "thinking_budget_tokens": _get_int("THINKING_BUDGET_TOKENS", 10000),
 
     # Runtime controls
-    "assets": _get_env("ASSETS"),  # e.g., "BTC ETH SOL OIL GOLD SPX"
-    "interval": _get_env("INTERVAL"),  # e.g., "5m", "1h"
+    "assets": _get_env("ASSETS"),
+    "interval": _get_env("INTERVAL"),
 
     # Risk management
     "max_position_pct": _get_env("MAX_POSITION_PCT", "20"),
@@ -156,10 +156,11 @@ CONFIG = {
     "min_trade_confidence": _get_float("MIN_TRADE_CONFIDENCE", 0.55),
 
     # API server
-    "api_host": _get_env("API_HOST", "0.0.0.0"),
+    "api_host": _get_env("API_HOST", "127.0.0.1"),   # Default to loopback, NOT 0.0.0.0
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",
+    "api_secret": _get_env("API_SECRET", ""),  # Empty = unauthenticated (dev only)
 
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),
-}
+})
