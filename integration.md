@@ -1,90 +1,143 @@
 # Custom Algo Integration
 
-This project supports plug-and-play custom algorithm strategies through a plain Python file.
+This project supports plug-and-play custom strategy logic through a Python file (default: `algo.py`).
 
-## Quick Start
+## 1) Quick Start
 
-1. Copy your strategy into algo.py at project root (or set a custom path).
-2. Implement the required function shown below.
-3. Enable algo mode in .env.
-4. Run the bot normally.
+1. Create or edit `algo.py` at project root (or point to another file with `ALGO_FILE_PATH`).
+2. Implement `generate_trade_decisions(context)`.
+3. Set `ENABLE_ALGO_TRADING=true`.
+4. Run the bot.
 
-## Required Function
+If custom loading/execution fails, the runtime falls back to built-in deterministic rules.
 
-Your strategy file MUST define this function:
+## 2) Required Function
 
-generate_trade_decisions(context)
+Your strategy file must export:
 
-For a stable confidence-to-leverage contract across different trader algos,
-you should also keep these helper functions in `algo.py`:
+`generate_trade_decisions(context)`
 
-- calculate_confidence(asset_section, direction) -> float in [0, 1]
-- confidence_to_leverage(confidence, max_leverage=10) -> float in [1, 10]
+Input: one dictionary. Output: either dict or list (details below).
 
-If this function is missing, the engine will log a warning and fall back to the built-in deterministic strategy.
+## 3) Input Contract
 
-## Function Input
+`context` contains:
 
-context is a dictionary with:
+- `assets`: list of symbols requested this cycle
+- `market_data`: per-asset snapshots from local indicator pipeline
+- `capital_budget_usd`: budget allocated to algo source for this cycle
+- `account`: account/dashboard snapshot
+- `invocation`: cycle metadata
 
-- assets: list[str]
-- market_data: list[dict]
-- capital_budget_usd: float
-- account: dict
-- invocation: dict
+Current invocation keys include:
 
-market_data contains per-asset snapshots (current price, intraday indicators, long-term indicators, funding, OI).
+- `cycle`
+- `current_time` (UTC ISO string)
+- `interval`
 
-## Function Output
+## 4) Output Contract
 
-Return either of these:
+You can return either:
 
-1) Dict format
-- reasoning: str
-- trade_decisions: list[dict]
+1. Dict form
+	- `reasoning`: string
+	- `trade_decisions`: list of decisions
+2. List form
+	- list of decisions directly
 
-2) List format
-- trade_decisions only (list[dict])
+Decision fields supported:
 
-Each trade_decisions item supports:
+- `asset` (required)
+- `action`: `buy` | `sell` | `hold`
+- `allocation_usd`
+- `order_type`: `market` | `limit`
+- `limit_price`
+- `tp_price`
+- `sl_price`
+- `exit_plan`
+- `rationale`
+- `confidence` (recommended)
+- `leverage` or `requested_leverage` (recommended)
 
-- asset: str
-- action: buy | sell | hold
-- allocation_usd: float
-- order_type: market | limit
-- limit_price: float | None
-- tp_price: float | None
-- sl_price: float | None
-- exit_plan: str
-- rationale: str
-- confidence: float | None (recommended)
-- leverage: float | None (recommended)
+Normalization behavior performed by runtime:
 
-When confidence is supplied, low-confidence actionable trades can be blocked by
-the risk manager using `MIN_TRADE_CONFIDENCE`.
+- invalid/missing action -> `hold`
+- invalid order type -> `market`
+- market orders force `limit_price=null`
+- missing assets in your output become `hold`
 
-Any missing asset is treated as hold.
+## 5) Runtime Behavior After Algo Output
 
-## Env Configuration
+After your function returns, the system still applies:
 
-Set in .env:
+1. Source budget scaling (`capital_budget_usd`) so actionable notional fits budget.
+2. Source merge logic (if AI is also enabled):
+	- same-direction signals combine
+	- direction conflicts become `hold` for that asset
+3. Full risk validation before execution:
+	- confidence threshold if provided (`MIN_TRADE_CONFIDENCE`)
+	- leverage clamped to `[1, MAX_LEVERAGE]`
+	- mandatory SL auto-set if missing
+	- exposure, drawdown, reserve, and concurrency checks
 
-- ENABLE_ALGO_TRADING=true
-- ALGO_CAPITAL_PCT=40
-- ALGO_FILE_PATH=algo.py
-- MIN_TRADE_CONFIDENCE=0.55
+Important: risk checks are authoritative. Algo output cannot bypass them.
 
-Optional dual-mode setup:
+## 6) Environment Configuration
 
-- ENABLE_AI_TRADING=true
-- AI_CAPITAL_PCT=60
-- AI_PROVIDER=openai (or anthropic/gemini)
-- AI_MODEL=gpt-4.1 (or provider-specific model)
+Minimum algo-only setup:
 
-Rule: enabled capital percentages must each be in [0, 100], and enabled total must not exceed 100.
+```env
+ENABLE_AI_TRADING=false
+ENABLE_ALGO_TRADING=true
+ALGO_CAPITAL_PCT=100
+ALGO_FILE_PATH=algo.py
+```
 
-## Safety Notes
+Hybrid setup example:
 
-- Risk checks still run after your algorithm decisions.
-- Invalid custom output is normalized where possible.
-- If your file errors at runtime, the engine falls back to built-in algo logic.
+```env
+ENABLE_AI_TRADING=true
+AI_CAPITAL_PCT=60
+ENABLE_ALGO_TRADING=true
+ALGO_CAPITAL_PCT=40
+```
+
+Rules:
+
+- each enabled capital percentage must be in `[0, 100]`
+- enabled total must be `<= 100`
+- at least one mode must be enabled
+
+## 7) Recommended Pattern
+
+Use confidence + leverage in output for tighter control:
+
+- `confidence` in `[0, 1]`
+- `leverage` in `[1, MAX_LEVERAGE]`
+
+The default `algo.py` template already demonstrates this pattern with:
+
+- `calculate_confidence(...)`
+- `confidence_to_leverage(...)`
+
+## 8) Minimal Example
+
+```python
+def generate_trade_decisions(context):
+	 decisions = []
+	 for asset in context.get("assets", []):
+		  decisions.append({
+				"asset": asset,
+				"action": "hold",
+				"allocation_usd": 0.0,
+				"order_type": "market",
+				"limit_price": None,
+				"tp_price": None,
+				"sl_price": None,
+				"exit_plan": "",
+				"rationale": "No setup this cycle.",
+				"confidence": 0.0,
+				"leverage": 1.0,
+		  })
+	 return {"reasoning": "Conservative hold strategy.", "trade_decisions": decisions}
+```
