@@ -68,6 +68,14 @@ class CycleRunner:
         interval_secs = get_interval_seconds(self.interval)
 
         logging.info("Loaded %d active trades from disk", len(self.active_trades))
+        try:
+            await self.reconciliation_service.bootstrap_active_trades(
+                self.active_trades,
+                tracked_assets=self.assets,
+            )
+        except Exception as exc:
+            logging.error("Startup reconciliation failed: %s", exc)
+
         while not self.shutdown_event.is_set():
             cycle_start = datetime.now(timezone.utc)
             self.invocation_count += 1
@@ -78,13 +86,14 @@ class CycleRunner:
                 await self.reconciliation_service.force_close_losers(
                     state, self.active_trades, cycle_start
                 )
+                state, account_value = await self.market_data_service.fetch_account_state()
             except Exception as exc:
                 logging.error("Risk force-close error: %s", exc)
                 state, account_value = await self.market_data_service.fetch_account_state()
 
             try:
                 open_orders = await self.reconciliation_service.reconcile_active_trades(
-                    state, self.active_trades, cycle_start
+                    state, self.active_trades, cycle_start, tracked_assets=self.assets
                 )
             except Exception as exc:
                 logging.error("Reconcile error: %s", exc)

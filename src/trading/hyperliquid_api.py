@@ -8,11 +8,13 @@ the trading agent can depend on predictable, non-blocking IO.
 
 import asyncio
 import logging
+import secrets
 import aiohttp
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants  # For MAINNET/TESTNET
+from hyperliquid.utils.types import Cloid
 from eth_account import Account as _Account
 from eth_account.signers.local import LocalAccount
 from websocket._exceptions import WebSocketConnectionClosedException
@@ -132,6 +134,195 @@ class HyperliquidAPI:
                 break
         raise last_err if last_err else RuntimeError("Hyperliquid retry: unknown error")
 
+    async def _submit_exchange_call(self, fn, *args, **kwargs):
+        """Submit a write action exactly once to avoid duplicate live orders.
+
+        Exchange writes are not safely retryable without idempotency. We therefore
+        submit them once and rely on client order ids plus later reconciliation
+        instead of automatic resubmission.
+        """
+        return await self._retry(
+            fn,
+            *args,
+            max_attempts=1,
+            reset_on_fail=False,
+            **kwargs,
+        )
+
+    def generate_client_order_id(self) -> str:
+        """Return a Hyperliquid-compatible 16-byte hex client order id."""
+        return f"0x{secrets.token_hex(16)}"
+
+    def _coerce_cloid(self, cloid_raw: str | None) -> Cloid | None:
+        if not cloid_raw:
+            return None
+        return Cloid.from_str(str(cloid_raw))
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def summarize_order_result(self, order_result: Any) -> dict[str, Any]:
+        """Normalize an order placement response into actionable execution facts."""
+        summary: dict[str, Any] = {
+            "ok": False,
+            "is_success": False,
+            "has_error": False,
+            "error_messages": [],
+            "statuses": [],
+            "resting_oids": [],
+            "filled_oids": [],
+            "all_oids": [],
+            "filled_size": 0.0,
+            "avg_fill_price": None,
+            "raw": order_result,
+        }
+
+        if not isinstance(order_result, dict):
+            summary["error_messages"].append("Non-dict order response")
+            summary["has_error"] = True
+            return summary
+
+        summary["ok"] = order_result.get("status") == "ok"
+        if not summary["ok"]:
+            message = order_result.get("response") or order_result.get("error") or "Exchange returned non-ok status"
+            summary["error_messages"].append(str(message))
+            summary["has_error"] = True
+            return summary
+
+        statuses = (
+            order_result.get("response", {})
+            .get("data", {})
+            .get("statuses", [])
+        )
+        if not isinstance(statuses, list):
+            statuses = []
+
+        fill_prices: list[float] = []
+        for status_entry in statuses:
+            if not isinstance(status_entry, dict):
+                continue
+
+            normalized: dict[str, Any] = {"raw": status_entry}
+            if "resting" in status_entry:
+                payload = status_entry.get("resting") or {}
+                oid = payload.get("oid")
+                normalized.update({"type": "resting", "oid": oid})
+                if oid is not None:
+                    summary["resting_oids"].append(str(oid))
+            elif "filled" in status_entry:
+                payload = status_entry.get("filled") or {}
+                oid = payload.get("oid")
+                fill_size = self._safe_float(payload.get("totalSz") or payload.get("sz")) or 0.0
+                avg_fill_price = self._safe_float(payload.get("avgPx") or payload.get("px"))
+                normalized.update(
+                    {
+                        "type": "filled",
+                        "oid": oid,
+                        "filled_size": fill_size,
+                        "avg_fill_price": avg_fill_price,
+                    }
+                )
+                summary["filled_size"] += fill_size
+                if avg_fill_price is not None:
+                    fill_prices.append(avg_fill_price)
+                if oid is not None:
+                    summary["filled_oids"].append(str(oid))
+            elif "error" in status_entry:
+                normalized.update({"type": "error", "message": str(status_entry.get("error"))})
+                summary["has_error"] = True
+                summary["error_messages"].append(str(status_entry.get("error")))
+            else:
+                key = next(iter(status_entry.keys()), "unknown")
+                normalized.update({"type": str(key), "payload": status_entry.get(key)})
+
+            summary["statuses"].append(normalized)
+
+        summary["all_oids"] = summary["resting_oids"] + summary["filled_oids"]
+        summary["avg_fill_price"] = (
+            round(sum(fill_prices) / len(fill_prices), 8) if fill_prices else None
+        )
+        summary["is_success"] = summary["ok"] and not summary["has_error"]
+        return summary
+
+    async def query_order_status(
+        self, oid: int | None = None, cloid_raw: str | None = None
+    ) -> dict[str, Any] | None:
+        """Query a specific order status by exchange id or client order id."""
+        if oid is None and not cloid_raw:
+            return None
+
+        try:
+            if cloid_raw:
+                cloid = self._coerce_cloid(cloid_raw)
+                if hasattr(self.info, "query_order_by_cloid"):
+                    raw = await self._retry(
+                        lambda: self.info.query_order_by_cloid(self.query_address, cloid)
+                    )
+                else:
+                    raw = await self._retry(
+                        lambda: self.info.post(
+                            "/info",
+                            {"type": "orderStatus", "user": self.query_address, "oid": cloid.to_raw()},
+                        )
+                    )
+            else:
+                if hasattr(self.info, "query_order_by_oid"):
+                    raw = await self._retry(
+                        lambda: self.info.query_order_by_oid(self.query_address, int(oid))
+                    )
+                else:
+                    raw = await self._retry(
+                        lambda: self.info.post(
+                            "/info",
+                            {"type": "orderStatus", "user": self.query_address, "oid": int(oid)},
+                        )
+                    )
+        except Exception as exc:
+            logging.error("Order status query failed (oid=%s cloid=%s): %s", oid, cloid_raw, exc)
+            return None
+
+        if not isinstance(raw, dict):
+            return {"exists": False, "status": "unknown", "raw": raw}
+
+        order_block = raw.get("order") if raw.get("status") == "order" else None
+        order = order_block.get("order", {}) if isinstance(order_block, dict) else {}
+        status = str(order_block.get("status") or raw.get("status") or "unknown")
+        cancelled_statuses = {
+            "canceled",
+            "marginCanceled",
+            "vaultWithdrawalCanceled",
+            "openInterestCapCanceled",
+            "selfTradeCanceled",
+            "reduceOnlyCanceled",
+            "siblingFilledCanceled",
+            "delistedCanceled",
+            "liquidatedCanceled",
+            "scheduledCancel",
+        }
+        rejected_statuses = {"rejected", "tickRejected"}
+        is_open = status in {"open", "triggered"}
+        is_filled = status == "filled"
+        is_canceled = status in cancelled_statuses
+        is_rejected = status in rejected_statuses
+        return {
+            "exists": bool(order_block),
+            "status": status,
+            "is_open": is_open,
+            "is_filled": is_filled,
+            "is_canceled": is_canceled,
+            "is_rejected": is_rejected,
+            "is_final": is_filled or is_canceled or is_rejected,
+            "oid": order.get("oid"),
+            "cloid": order.get("cloid") or cloid_raw,
+            "coin": order.get("coin"),
+            "size": self._safe_float(order.get("origSz") or order.get("sz")),
+            "raw": raw,
+        }
+
     def round_size(self, asset, amount):
         """Round order size to the asset precision defined by market metadata.
 
@@ -163,7 +354,7 @@ class HyperliquidAPI:
                     return round(amount, decimals)
         return round(amount, 8)
 
-    async def place_buy_order(self, asset, amount, slippage=0.01):
+    async def place_buy_order(self, asset, amount, slippage=0.01, cloid_raw: str | None = None):
         """Submit a market buy order with exchange-side rounding and retry logic.
 
         Args:
@@ -175,9 +366,12 @@ class HyperliquidAPI:
             Raw SDK response from :meth:`Exchange.market_open`.
         """
         amount = self.round_size(asset, amount)
-        return await self._retry(lambda: self.exchange.market_open(asset, True, amount, None, slippage))
+        cloid = self._coerce_cloid(cloid_raw)
+        return await self._submit_exchange_call(
+            lambda: self.exchange.market_open(asset, True, amount, None, slippage, cloid=cloid)
+        )
 
-    async def place_sell_order(self, asset, amount, slippage=0.01):
+    async def place_sell_order(self, asset, amount, slippage=0.01, cloid_raw: str | None = None):
         """Submit a market sell order with exchange-side rounding and retry logic.
 
         Args:
@@ -189,9 +383,19 @@ class HyperliquidAPI:
             Raw SDK response from :meth:`Exchange.market_open`.
         """
         amount = self.round_size(asset, amount)
-        return await self._retry(lambda: self.exchange.market_open(asset, False, amount, None, slippage))
+        cloid = self._coerce_cloid(cloid_raw)
+        return await self._submit_exchange_call(
+            lambda: self.exchange.market_open(asset, False, amount, None, slippage, cloid=cloid)
+        )
 
-    async def place_limit_buy(self, asset, amount, limit_price, tif="Gtc"):
+    async def place_limit_buy(
+        self,
+        asset,
+        amount,
+        limit_price,
+        tif="Gtc",
+        cloid_raw: str | None = None,
+    ):
         """Submit a limit buy order.
 
         Args:
@@ -206,9 +410,19 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"limit": {"tif": tif}}
-        return await self._retry(lambda: self.exchange.order(asset, True, amount, limit_price, order_type))
+        cloid = self._coerce_cloid(cloid_raw)
+        return await self._submit_exchange_call(
+            lambda: self.exchange.order(asset, True, amount, limit_price, order_type, cloid=cloid)
+        )
 
-    async def place_limit_sell(self, asset, amount, limit_price, tif="Gtc"):
+    async def place_limit_sell(
+        self,
+        asset,
+        amount,
+        limit_price,
+        tif="Gtc",
+        cloid_raw: str | None = None,
+    ):
         """Submit a limit sell order.
 
         Args:
@@ -222,7 +436,10 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"limit": {"tif": tif}}
-        return await self._retry(lambda: self.exchange.order(asset, False, amount, limit_price, order_type))
+        cloid = self._coerce_cloid(cloid_raw)
+        return await self._submit_exchange_call(
+            lambda: self.exchange.order(asset, False, amount, limit_price, order_type, cloid=cloid)
+        )
 
     async def set_leverage(self, asset, leverage, is_cross=True):
         """Set the asset leverage with guardrails and retry behavior.
@@ -244,7 +461,14 @@ class HyperliquidAPI:
             logging.error("Set leverage error for %s: %s", asset, e)
             return {"status": "error", "message": str(e)}
 
-    async def place_take_profit(self, asset, is_buy, amount, tp_price):
+    async def place_take_profit(
+        self,
+        asset,
+        is_buy,
+        amount,
+        tp_price,
+        cloid_raw: str | None = None,
+    ):
         """Create a reduce-only trigger order that executes a take-profit exit.
 
         Args:
@@ -259,9 +483,19 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
-        return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, tp_price, order_type, True))
+        cloid = self._coerce_cloid(cloid_raw)
+        return await self._submit_exchange_call(
+            lambda: self.exchange.order(asset, not is_buy, amount, tp_price, order_type, True, cloid=cloid)
+        )
 
-    async def place_stop_loss(self, asset, is_buy, amount, sl_price):
+    async def place_stop_loss(
+        self,
+        asset,
+        is_buy,
+        amount,
+        sl_price,
+        cloid_raw: str | None = None,
+    ):
         """Create a reduce-only trigger order that executes a stop-loss exit.
 
         Args:
@@ -276,7 +510,29 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}}
-        return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True))
+        cloid = self._coerce_cloid(cloid_raw)
+        return await self._submit_exchange_call(
+            lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True, cloid=cloid)
+        )
+
+    async def close_position_market(
+        self,
+        asset,
+        amount: float | None = None,
+        slippage: float = 0.01,
+        cloid_raw: str | None = None,
+    ):
+        """Close an existing position with a reduce-only market order."""
+        rounded_amount = self.round_size(asset, amount) if amount is not None else None
+        cloid = self._coerce_cloid(cloid_raw)
+        return await self._submit_exchange_call(
+            lambda: self.exchange.market_close(
+                asset,
+                sz=rounded_amount,
+                slippage=slippage,
+                cloid=cloid,
+            )
+        )
 
     async def cancel_order(self, asset, oid):
         """Cancel a single order by identifier for a given asset.
@@ -316,6 +572,9 @@ class HyperliquidAPI:
             for o in orders:
                 try:
                     ot = o.get("orderType")
+                    o["reduceOnly"] = bool(o.get("reduceOnly") or o.get("reduce_only"))
+                    if o.get("cloid") is not None:
+                        o["cloid"] = str(o.get("cloid"))
                     if isinstance(ot, dict) and "trigger" in ot:
                         trig = ot.get("trigger") or {}
                         if "triggerPx" in trig:
@@ -360,17 +619,7 @@ class HyperliquidAPI:
         Returns:
             List of order identifiers present in resting or filled status entries.
         """
-        oids = []
-        try:
-            statuses = order_result["response"]["data"]["statuses"]
-            for st in statuses:
-                if "resting" in st and "oid" in st["resting"]:
-                    oids.append(st["resting"]["oid"])
-                if "filled" in st and "oid" in st["filled"]:
-                    oids.append(st["filled"]["oid"])
-        except (KeyError, TypeError, ValueError):
-            pass
-        return oids
+        return self.summarize_order_result(order_result)["all_oids"]
 
     async def get_user_state(self):
         """Retrieve wallet state with enriched position PnL calculations.
@@ -415,7 +664,8 @@ class HyperliquidAPI:
                 logging.warning("Failed to fetch spot state for unified account: %s", e)
 
         if not total_value:
-            total_value = balance + sum(max(p.get("pnl", 0.0), 0.0) for p in enriched_positions)
+            reconstructed_value = balance + sum(float(p.get("pnl", 0.0) or 0.0) for p in enriched_positions)
+            total_value = reconstructed_value if reconstructed_value > 0 else 0.0
         return {"balance": balance, "total_value": total_value, "positions": enriched_positions}
 
     async def get_current_price(self, asset):

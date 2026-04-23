@@ -73,7 +73,9 @@ class MarketDataService:
             {
                 "coin": order.get("coin"),
                 "oid": order.get("oid"),
+                "cloid": order.get("cloid"),
                 "is_buy": order.get("isBuy"),
+                "reduce_only": order.get("reduceOnly") or order.get("reduce_only"),
                 "size": round_or_none(order.get("sz"), 6),
                 "price": round_or_none(order.get("px"), 2),
                 "trigger_price": round_or_none(order.get("triggerPx"), 2),

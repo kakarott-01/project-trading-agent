@@ -38,6 +38,13 @@ class ActiveTradeRecord:
     order_type: str = "market"
     limit_price: float | None = None
     actual_filled: float | None = None
+    tp_price: float | None = None
+    sl_price: float | None = None
+    entry_oid: str | None = None
+    client_order_id: str | None = None
+    status: str = "unknown"
+    source: str = "none"
+    last_synced_at: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ActiveTradeRecord":
@@ -59,6 +66,13 @@ class ActiveTradeRecord:
             actual_filled=(
                 float(data["actual_filled"]) if data.get("actual_filled") is not None else None
             ),
+            tp_price=float(data["tp_price"]) if data.get("tp_price") is not None else None,
+            sl_price=float(data["sl_price"]) if data.get("sl_price") is not None else None,
+            entry_oid=data.get("entry_oid"),
+            client_order_id=data.get("client_order_id"),
+            status=str(data.get("status") or "unknown"),
+            source=str(data.get("source") or "none"),
+            last_synced_at=data.get("last_synced_at"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -76,6 +90,13 @@ class ActiveTradeRecord:
             "order_type": self.order_type,
             "limit_price": self.limit_price,
             "actual_filled": self.actual_filled,
+            "tp_price": self.tp_price,
+            "sl_price": self.sl_price,
+            "entry_oid": self.entry_oid,
+            "client_order_id": self.client_order_id,
+            "status": self.status,
+            "source": self.source,
+            "last_synced_at": self.last_synced_at,
         }
 
 

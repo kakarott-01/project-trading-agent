@@ -32,8 +32,12 @@ class ApplicationRuntime:
         self.risk_manager = RiskManager(settings=settings)
         self.market_data_service = MarketDataService(self.broker)
         self.decision_pipeline = DecisionPipeline()
-        self.execution_service = ExecutionService(self.broker, self.risk_manager)
         self.reconciliation_service = ReconciliationService(self.broker, self.risk_manager)
+        self.execution_service = ExecutionService(
+            self.broker,
+            self.risk_manager,
+            self.reconciliation_service,
+        )
         self.api_server = ApiServer(settings)
 
         strategies: list[tuple[Strategy, float]] = []
