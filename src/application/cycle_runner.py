@@ -100,6 +100,29 @@ class CycleRunner:
                 open_orders = []
 
             try:
+                state = await self.market_data_service.broker.get_user_state()
+                account_value = float(state.get("total_value") or account_value)
+            except Exception as exc:
+                logging.error("State refresh after reconcile failed: %s", exc)
+
+            drawdown_ok, drawdown_reason = self.risk_manager.check_daily_drawdown(account_value)
+            if not drawdown_ok:
+                logging.warning("Risk breaker state: %s", drawdown_reason)
+
+            cancelled_pending = await self._cancel_pending_entries_outside_limits(
+                state=state,
+                cycle_start=cycle_start,
+            )
+            if cancelled_pending > 0:
+                open_orders = await self.market_data_service.broker.get_open_orders()
+
+            trading_halted = self.risk_manager.circuit_breaker_active
+            if trading_halted:
+                logging.warning(
+                    "Circuit breaker active: skipping new trade decisions this cycle"
+                )
+
+            try:
                 fills = await self.market_data_service.broker.get_recent_fills(limit=50)
             except Exception:
                 fills = []
@@ -124,30 +147,36 @@ class CycleRunner:
                 interval=self.interval,
             )
 
-            strategy_contexts = []
-            for strategy, capital_pct in self.strategies:
-                capital_budget_usd = account_value * (capital_pct / 100.0)
-                strategy_contexts.append(
-                    (
-                        strategy,
-                        DecisionContext(
-                            assets=self.assets,
-                            market_snapshots=market_snapshots,
-                            account_dashboard=dashboard,
-                            risk_limits=self.risk_manager.get_risk_summary(),
-                            invocation=invocation,
-                            capital_budget_usd=capital_budget_usd,
-                            provider_label=strategy.source,
-                        ),
+            if trading_halted:
+                reasoning_chunks = [
+                    "Trading halted: daily loss circuit breaker active; pending entry orders are being cancelled.",
+                ]
+                merged_decisions = []
+            else:
+                strategy_contexts = []
+                for strategy, capital_pct in self.strategies:
+                    capital_budget_usd = account_value * (capital_pct / 100.0)
+                    strategy_contexts.append(
+                        (
+                            strategy,
+                            DecisionContext(
+                                assets=self.assets,
+                                market_snapshots=market_snapshots,
+                                account_dashboard=dashboard,
+                                risk_limits=self.risk_manager.get_risk_summary(),
+                                invocation=invocation,
+                                capital_budget_usd=capital_budget_usd,
+                                provider_label=strategy.source,
+                            ),
+                        )
                     )
-                )
 
-            all_source_decisions, reasoning_chunks = await self.decision_pipeline.run_strategies(
-                strategy_contexts
-            )
-            merged_decisions = self.decision_pipeline.merge_trade_decisions(
-                all_source_decisions, self.assets
-            )
+                all_source_decisions, reasoning_chunks = await self.decision_pipeline.run_strategies(
+                    strategy_contexts
+                )
+                merged_decisions = self.decision_pipeline.merge_trade_decisions(
+                    all_source_decisions, self.assets
+                )
             self._persist_cycle_log(
                 cycle_start=cycle_start,
                 reasoning_chunks=reasoning_chunks,
@@ -156,15 +185,16 @@ class CycleRunner:
                 balance=state["balance"],
             )
 
-            await self.execution_service.execute(
-                intents=merged_decisions,
-                assets=self.assets,
-                cycle_start=cycle_start,
-                asset_prices=asset_prices,
-                active_trades=self.active_trades,
-                shutdown_event=self.shutdown_event,
-                trade_log=self.trade_log,
-            )
+            if not trading_halted:
+                await self.execution_service.execute(
+                    intents=merged_decisions,
+                    assets=self.assets,
+                    cycle_start=cycle_start,
+                    asset_prices=asset_prices,
+                    active_trades=self.active_trades,
+                    shutdown_event=self.shutdown_event,
+                    trade_log=self.trade_log,
+                )
 
             elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
             sleep_for = max(0.0, interval_secs - elapsed)
@@ -184,6 +214,35 @@ class CycleRunner:
 
         logging.info("Bot loop exited cleanly after %d cycles", self.invocation_count)
         save_active_trades([trade.to_dict() for trade in self.active_trades])
+
+    async def _cancel_pending_entries_outside_limits(
+        self,
+        state: dict,
+        cycle_start: datetime,
+    ) -> int:
+        to_cancel = self.risk_manager.get_entry_orders_to_cancel(state)
+        cancelled = 0
+        for order in to_cancel:
+            asset = str(order.get("coin") or order.get("asset") or "")
+            oid = order.get("oid")
+            if not asset or oid is None:
+                continue
+            try:
+                await self.market_data_service.broker.cancel_order(asset, oid)
+                cancelled += 1
+                logging.warning(
+                    "Cancelled pending entry order oid=%s for %s due to risk limits",
+                    oid,
+                    asset,
+                )
+            except Exception as exc:
+                logging.error(
+                    "Failed to cancel pending entry order oid=%s for %s: %s",
+                    oid,
+                    asset,
+                    exc,
+                )
+        return cancelled
 
     def _persist_cycle_log(
         self,

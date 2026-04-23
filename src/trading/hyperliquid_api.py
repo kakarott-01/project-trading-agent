@@ -165,6 +165,13 @@ class HyperliquidAPI:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _is_reduce_only_order(order: dict[str, Any]) -> bool:
+        if bool(order.get("reduceOnly") or order.get("reduce_only")):
+            return True
+        order_type = order.get("orderType")
+        return isinstance(order_type, dict) and "trigger" in order_type
+
     def summarize_order_result(self, order_result: Any) -> dict[str, Any]:
         """Normalize an order placement response into actionable execution facts."""
         summary: dict[str, Any] = {
@@ -643,6 +650,12 @@ class HyperliquidAPI:
             pnl = (current_px - entry_px) * abs(size) if side == "long" else (entry_px - current_px) * abs(size)
             pos["pnl"] = pnl
             pos["notional_entry"] = abs(size) * entry_px
+            pos["markPx"] = current_px if current_px > 0 else pos.get("markPx")
+            pos["notional_current"] = abs(size) * (current_px if current_px > 0 else entry_px)
+            explicit_position_value = self._safe_float(
+                pos.get("positionValue") or pos.get("position_value")
+            )
+            pos["position_value"] = abs(explicit_position_value) if explicit_position_value is not None else pos["notional_current"]
             enriched_positions.append(pos)
         balance = float(state.get("withdrawable", 0.0))
 
@@ -663,10 +676,47 @@ class HyperliquidAPI:
             except Exception as e:
                 logging.warning("Failed to fetch spot state for unified account: %s", e)
 
-        if not total_value:
+        if total_value == 0.0:
             reconstructed_value = balance + sum(float(p.get("pnl", 0.0) or 0.0) for p in enriched_positions)
-            total_value = reconstructed_value if reconstructed_value > 0 else 0.0
-        return {"balance": balance, "total_value": total_value, "positions": enriched_positions}
+            total_value = reconstructed_value
+
+        open_orders = await self.get_open_orders()
+        pending_entry_orders: list[dict[str, Any]] = []
+        pending_entry_assets: set[str] = set()
+        for order in open_orders:
+            if self._is_reduce_only_order(order):
+                continue
+            asset = str(order.get("coin") or "")
+            if not asset:
+                continue
+            size = abs(self._safe_float(order.get("sz") or order.get("size") or 0.0) or 0.0)
+            if size <= 0:
+                continue
+            px = self._safe_float(order.get("px") or order.get("price") or order.get("limitPx"))
+            if px is None or px <= 0:
+                px = await self.get_current_price(asset)
+            notional = size * max(px or 0.0, 0.0)
+            pending_entry_orders.append(
+                {
+                    "coin": asset,
+                    "asset": asset,
+                    "oid": order.get("oid"),
+                    "cloid": order.get("cloid"),
+                    "isBuy": order.get("isBuy"),
+                    "sz": size,
+                    "px": px,
+                    "notional": notional,
+                }
+            )
+            pending_entry_assets.add(asset)
+
+        return {
+            "balance": balance,
+            "total_value": total_value,
+            "positions": enriched_positions,
+            "pending_entry_orders": pending_entry_orders,
+            "pending_entry_assets": sorted(pending_entry_assets),
+        }
 
     async def get_current_price(self, asset):
         """Return the latest mid-price for ``asset``.

@@ -260,6 +260,7 @@ class ReconciliationService:
 
             entry_orders, reduce_orders = self._split_asset_orders(open_orders, trade.asset)
             del entry_orders
+            _tp_orders, sl_orders = self._extract_trigger_orders(reduce_orders)
             tp_oid, sl_oid, tp_price, sl_price = self._extract_trigger_details(reduce_orders)
             if tp_oid != trade.tp_oid:
                 trade.tp_oid = tp_oid
@@ -274,26 +275,58 @@ class ReconciliationService:
                 trade.sl_price = sl_price
                 changed = True
 
-            if not trade.sl_price and entry_price > 0:
-                trade.sl_price = self.risk_manager.enforce_stop_loss(None, entry_price, is_long)
+            if entry_price <= 0:
+                continue
+
+            validated_sl = self.risk_manager.enforce_stop_loss(trade.sl_price, entry_price, is_long)
+            if validated_sl != trade.sl_price:
+                trade.sl_price = validated_sl
                 changed = True
 
-            if not trade.sl_oid and trade.sl_price:
-                try:
-                    result = await self.broker.place_stop_loss(
-                        trade.asset,
-                        is_long,
-                        size,
-                        trade.sl_price,
-                        cloid_raw=self.broker.generate_client_order_id(),
+            sl_coverage = sum(order["size"] for order in sl_orders)
+            live_sl_price = sl_orders[0]["trigger_price"] if sl_orders else None
+            has_full_sl_coverage = bool(sl_orders) and sl_coverage >= size * 0.999
+            live_sl_valid = (
+                live_sl_price is not None
+                and self.risk_manager.enforce_stop_loss(live_sl_price, entry_price, is_long)
+                == round(live_sl_price, 8)
+            )
+
+            if not has_full_sl_coverage or not live_sl_valid:
+                repaired = await self._repair_stop_loss(
+                    trade=trade,
+                    size=size,
+                    is_long=is_long,
+                    entry_price=entry_price,
+                    sl_orders=sl_orders,
+                )
+                changed = True
+                if not repaired:
+                    await self._flatten_unprotected_position(
+                        trade=trade,
+                        size=size,
+                        cycle_start=cycle_start,
+                        reason=(
+                            "missing_or_invalid_stop_loss"
+                            if not has_full_sl_coverage
+                            else "invalid_stop_loss_side_or_distance"
+                        ),
                     )
-                    summary = self.broker.summarize_order_result(result)
-                    if summary["is_success"] and summary["all_oids"]:
-                        trade.sl_oid = summary["all_oids"][0]
-                        changed = True
-                        logging.info("Installed missing SL for %s", trade.asset)
-                except Exception as exc:
-                    logging.error("Failed to install SL for %s: %s", trade.asset, exc)
+                    continue
+
+                refreshed_orders = await self.broker.get_open_orders()
+                _, refreshed_reduce_orders = self._split_asset_orders(refreshed_orders, trade.asset)
+                _tp_orders, sl_orders = self._extract_trigger_orders(refreshed_reduce_orders)
+                tp_oid, sl_oid, tp_price, sl_price = self._extract_trigger_details(
+                    refreshed_reduce_orders
+                )
+                trade.tp_oid = tp_oid
+                trade.sl_oid = sl_oid
+                if tp_price is not None:
+                    trade.tp_price = tp_price
+                if sl_price is not None:
+                    trade.sl_price = sl_price
+                open_orders[:] = refreshed_orders
 
             if not trade.tp_oid and trade.tp_price:
                 try:
@@ -312,6 +345,116 @@ class ReconciliationService:
                 except Exception as exc:
                     logging.error("Failed to install TP for %s: %s", trade.asset, exc)
         return changed
+
+    async def _repair_stop_loss(
+        self,
+        trade: ActiveTradeRecord,
+        size: float,
+        is_long: bool,
+        entry_price: float,
+        sl_orders: list[dict[str, Any]],
+    ) -> bool:
+        target_sl = self.risk_manager.enforce_stop_loss(trade.sl_price, entry_price, is_long)
+        trade.sl_price = target_sl
+
+        for sl_order in sl_orders:
+            oid = sl_order.get("oid")
+            if oid is None:
+                continue
+            try:
+                await self.broker.cancel_order(trade.asset, oid)
+            except Exception as exc:
+                logging.warning(
+                    "Failed to cancel stale SL oid=%s for %s: %s",
+                    oid,
+                    trade.asset,
+                    exc,
+                )
+
+        try:
+            result = await self.broker.place_stop_loss(
+                trade.asset,
+                is_long,
+                size,
+                target_sl,
+                cloid_raw=self.broker.generate_client_order_id(),
+            )
+            summary = self.broker.summarize_order_result(result)
+            if not summary["is_success"]:
+                logging.error(
+                    "Failed to install SL for %s: %s",
+                    trade.asset,
+                    summary["error_messages"],
+                )
+                return False
+        except Exception as exc:
+            logging.error("Failed to install SL for %s: %s", trade.asset, exc)
+            return False
+
+        refreshed_orders = await self.broker.get_open_orders()
+        _, refreshed_reduce_orders = self._split_asset_orders(refreshed_orders, trade.asset)
+        _, refreshed_sl_orders = self._extract_trigger_orders(refreshed_reduce_orders)
+        if not refreshed_sl_orders:
+            return False
+
+        coverage = sum(order["size"] for order in refreshed_sl_orders)
+        live_sl_price = refreshed_sl_orders[0]["trigger_price"]
+        live_sl_valid = (
+            live_sl_price is not None
+            and self.risk_manager.enforce_stop_loss(live_sl_price, entry_price, is_long)
+            == round(live_sl_price, 8)
+        )
+        if coverage < size * 0.999 or not live_sl_valid:
+            return False
+
+        trade.sl_oid = str(refreshed_sl_orders[0]["oid"])
+        trade.sl_price = round(float(live_sl_price), 8)
+        trade.status = "open_position"
+        logging.info(
+            "Installed fail-closed SL for %s covering %.6f/%.6f",
+            trade.asset,
+            coverage,
+            size,
+        )
+        return True
+
+    async def _flatten_unprotected_position(
+        self,
+        trade: ActiveTradeRecord,
+        size: float,
+        cycle_start: datetime,
+        reason: str,
+    ) -> None:
+        close_cloid = self.broker.generate_client_order_id()
+        try:
+            await self.broker.cancel_all_orders(trade.asset)
+            result = await self.broker.close_position_market(
+                trade.asset,
+                amount=size,
+                cloid_raw=close_cloid,
+            )
+            summary = self.broker.summarize_order_result(result)
+            close_ok = bool(summary.get("is_success"))
+        except Exception as exc:
+            close_ok = False
+            logging.error("Failed fail-closed flatten for %s: %s", trade.asset, exc)
+
+        trade.status = "failed_no_stop"
+        trade.tp_oid = None
+        trade.sl_oid = None
+        trade.last_synced_at = cycle_start.isoformat()
+
+        self._append_diary(
+            {
+                "timestamp": cycle_start.isoformat(),
+                "asset": trade.asset,
+                "action": "fail_closed_flatten",
+                "reason": reason,
+                "requested_size": size,
+                "closed": close_ok,
+                "client_order_id": close_cloid,
+            }
+        )
 
     def _build_record(
         self,
@@ -459,10 +602,19 @@ class ReconciliationService:
     def _extract_trigger_details(
         reduce_orders: list[dict[str, Any]]
     ) -> tuple[str | None, str | None, float | None, float | None]:
-        tp_oid = None
-        sl_oid = None
-        tp_price = None
-        sl_price = None
+        tp_orders, sl_orders = ReconciliationService._extract_trigger_orders(reduce_orders)
+        tp_oid = str(tp_orders[0]["oid"]) if tp_orders else None
+        sl_oid = str(sl_orders[0]["oid"]) if sl_orders else None
+        tp_price = tp_orders[0]["trigger_price"] if tp_orders else None
+        sl_price = sl_orders[0]["trigger_price"] if sl_orders else None
+        return tp_oid, sl_oid, tp_price, sl_price
+
+    @staticmethod
+    def _extract_trigger_orders(
+        reduce_orders: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        tp_orders: list[dict[str, Any]] = []
+        sl_orders: list[dict[str, Any]] = []
         for order in reduce_orders:
             order_type = order.get("orderType")
             trigger = order_type.get("trigger") if isinstance(order_type, dict) else None
@@ -471,15 +623,22 @@ class ReconciliationService:
             trigger_px = ReconciliationService._safe_float(
                 order.get("triggerPx") or (trigger or {}).get("triggerPx")
             )
+            size = abs(
+                ReconciliationService._safe_float(order.get("sz") or order.get("size") or 0.0)
+                or 0.0
+            )
             if oid is None:
                 continue
-            if tpsl == "tp" and tp_oid is None:
-                tp_oid = str(oid)
-                tp_price = trigger_px
-            elif tpsl == "sl" and sl_oid is None:
-                sl_oid = str(oid)
-                sl_price = trigger_px
-        return tp_oid, sl_oid, tp_price, sl_price
+            normalized = {
+                "oid": oid,
+                "trigger_price": trigger_px,
+                "size": size,
+            }
+            if tpsl == "tp":
+                tp_orders.append(normalized)
+            elif tpsl == "sl":
+                sl_orders.append(normalized)
+        return tp_orders, sl_orders
 
     def _append_diary(self, entry: dict) -> None:
         with open(self.diary_path, "a", encoding="utf-8") as handle:

@@ -15,6 +15,48 @@ from src.utils.security import _SensitiveDict
 load_dotenv()
 
 
+# Immutable guardrails: runtime cannot exceed these bounds even via .env overrides.
+RISK_BOUNDS = {
+    "MAX_POSITION_PCT": (1.0, 25.0),
+    "MAX_LOSS_PER_POSITION_PCT": (0.5, 20.0),
+    "MAX_LEVERAGE": (1.0, 10.0),
+    "MAX_TOTAL_EXPOSURE_PCT": (1.0, 90.0),
+    "MAX_CORRELATED_BASKET_EXPOSURE_PCT": (5.0, 70.0),
+    "DAILY_LOSS_CIRCUIT_BREAKER_PCT": (1.0, 25.0),
+    "MANDATORY_SL_PCT": (0.1, 20.0),
+    "MAX_CONCURRENT_POSITIONS": (1.0, 10.0),
+    "MIN_BALANCE_RESERVE_PCT": (0.0, 50.0),
+    "MIN_TRADE_CONFIDENCE": (0.0, 1.0),
+}
+
+SAFE_RETAIL_PRESETS: dict[str, dict[str, float]] = {
+    "conservative": {
+        "max_position_pct": 5.0,
+        "max_loss_per_position_pct": 10.0,
+        "max_leverage": 3.0,
+        "max_total_exposure_pct": 30.0,
+        "max_correlated_basket_exposure_pct": 20.0,
+        "daily_loss_circuit_breaker_pct": 8.0,
+        "mandatory_sl_pct": 2.0,
+        "max_concurrent_positions": 3.0,
+        "min_balance_reserve_pct": 25.0,
+        "min_trade_confidence": 0.6,
+    },
+    "balanced": {
+        "max_position_pct": 10.0,
+        "max_loss_per_position_pct": 12.0,
+        "max_leverage": 5.0,
+        "max_total_exposure_pct": 50.0,
+        "max_correlated_basket_exposure_pct": 35.0,
+        "daily_loss_circuit_breaker_pct": 12.0,
+        "mandatory_sl_pct": 2.5,
+        "max_concurrent_positions": 5.0,
+        "min_balance_reserve_pct": 20.0,
+        "min_trade_confidence": 0.58,
+    },
+}
+
+
 def _get_env(name: str, default: str | None = None, required: bool = False) -> str | None:
     value = os.getenv(name, default)
     if required and (value is None or value == ""):
@@ -129,10 +171,13 @@ class RuntimeSettings:
 
 @dataclass(frozen=True)
 class RiskSettings:
+    safe_retail_mode: bool
+    safe_retail_preset: str
     max_position_pct: float
     max_loss_per_position_pct: float
     max_leverage: float
     max_total_exposure_pct: float
+    max_correlated_basket_exposure_pct: float
     daily_loss_circuit_breaker_pct: float
     mandatory_sl_pct: float
     max_concurrent_positions: int
@@ -220,6 +265,9 @@ class Settings:
                 "max_loss_per_position_pct": self.risk.max_loss_per_position_pct,
                 "max_leverage": self.risk.max_leverage,
                 "max_total_exposure_pct": self.risk.max_total_exposure_pct,
+                "safe_retail_mode": self.risk.safe_retail_mode,
+                "safe_retail_preset": self.risk.safe_retail_preset,
+                "max_correlated_basket_exposure_pct": self.risk.max_correlated_basket_exposure_pct,
                 "daily_loss_circuit_breaker_pct": self.risk.daily_loss_circuit_breaker_pct,
                 "mandatory_sl_pct": self.risk.mandatory_sl_pct,
                 "max_concurrent_positions": self.risk.max_concurrent_positions,
@@ -307,40 +355,73 @@ def _load_settings() -> Settings:
         interval=_get_env("INTERVAL"),
     )
 
-    risk = RiskSettings(
-        max_position_pct=float(_get_float("MAX_POSITION_PCT", 20.0) or 20.0),
-        max_loss_per_position_pct=float(
+    safe_retail_mode = _get_bool("SAFE_RETAIL_MODE", True)
+    safe_retail_preset = (
+        _get_env("SAFE_RETAIL_PRESET", "conservative") or "conservative"
+    ).strip().lower()
+    if safe_retail_mode and safe_retail_preset not in SAFE_RETAIL_PRESETS:
+        raise RuntimeError(
+            f"SAFE_RETAIL_PRESET '{safe_retail_preset}' is invalid; expected one of: "
+            f"{', '.join(sorted(SAFE_RETAIL_PRESETS))}"
+        )
+
+    risk_values = {
+        "max_position_pct": float(_get_float("MAX_POSITION_PCT", 20.0) or 20.0),
+        "max_loss_per_position_pct": float(
             _get_float("MAX_LOSS_PER_POSITION_PCT", 20.0) or 20.0
         ),
-        max_leverage=float(_get_float("MAX_LEVERAGE", 10.0) or 10.0),
-        max_total_exposure_pct=float(
+        "max_leverage": float(_get_float("MAX_LEVERAGE", 10.0) or 10.0),
+        "max_total_exposure_pct": float(
             _get_float("MAX_TOTAL_EXPOSURE_PCT", 80.0) or 80.0
         ),
-        daily_loss_circuit_breaker_pct=float(
+        "max_correlated_basket_exposure_pct": float(
+            _get_float("MAX_CORRELATED_BASKET_EXPOSURE_PCT", 60.0) or 60.0
+        ),
+        "daily_loss_circuit_breaker_pct": float(
             _get_float("DAILY_LOSS_CIRCUIT_BREAKER_PCT", 25.0) or 25.0
         ),
-        mandatory_sl_pct=float(_get_float("MANDATORY_SL_PCT", 5.0) or 5.0),
-        max_concurrent_positions=int(_get_int("MAX_CONCURRENT_POSITIONS", 10) or 10),
-        min_balance_reserve_pct=float(
+        "mandatory_sl_pct": float(_get_float("MANDATORY_SL_PCT", 5.0) or 5.0),
+        "max_concurrent_positions": float(_get_int("MAX_CONCURRENT_POSITIONS", 10) or 10),
+        "min_balance_reserve_pct": float(
             _get_float("MIN_BALANCE_RESERVE_PCT", 10.0) or 10.0
         ),
-        min_trade_confidence=float(_get_float("MIN_TRADE_CONFIDENCE", 0.55) or 0.55),
+        "min_trade_confidence": float(_get_float("MIN_TRADE_CONFIDENCE", 0.55) or 0.55),
+    }
+
+    if safe_retail_mode:
+        risk_values.update(SAFE_RETAIL_PRESETS[safe_retail_preset])
+
+    risk = RiskSettings(
+        safe_retail_mode=safe_retail_mode,
+        safe_retail_preset=safe_retail_preset,
+        max_position_pct=float(risk_values["max_position_pct"]),
+        max_loss_per_position_pct=float(risk_values["max_loss_per_position_pct"]),
+        max_leverage=float(risk_values["max_leverage"]),
+        max_total_exposure_pct=float(risk_values["max_total_exposure_pct"]),
+        max_correlated_basket_exposure_pct=float(
+            risk_values["max_correlated_basket_exposure_pct"]
+        ),
+        daily_loss_circuit_breaker_pct=float(risk_values["daily_loss_circuit_breaker_pct"]),
+        mandatory_sl_pct=float(risk_values["mandatory_sl_pct"]),
+        max_concurrent_positions=int(risk_values["max_concurrent_positions"]),
+        min_balance_reserve_pct=float(risk_values["min_balance_reserve_pct"]),
+        min_trade_confidence=float(risk_values["min_trade_confidence"]),
     )
 
     for label, value in (
         ("MAX_POSITION_PCT", risk.max_position_pct),
         ("MAX_LOSS_PER_POSITION_PCT", risk.max_loss_per_position_pct),
+        ("MAX_LEVERAGE", risk.max_leverage),
         ("MAX_TOTAL_EXPOSURE_PCT", risk.max_total_exposure_pct),
+        ("MAX_CORRELATED_BASKET_EXPOSURE_PCT", risk.max_correlated_basket_exposure_pct),
         ("DAILY_LOSS_CIRCUIT_BREAKER_PCT", risk.daily_loss_circuit_breaker_pct),
         ("MANDATORY_SL_PCT", risk.mandatory_sl_pct),
+        ("MAX_CONCURRENT_POSITIONS", float(risk.max_concurrent_positions)),
         ("MIN_BALANCE_RESERVE_PCT", risk.min_balance_reserve_pct),
+        ("MIN_TRADE_CONFIDENCE", risk.min_trade_confidence),
     ):
-        _require_range(label, value, 0, 100)
-    if risk.max_leverage < 1:
-        raise RuntimeError("MAX_LEVERAGE must be >= 1")
-    if risk.max_concurrent_positions < 1:
-        raise RuntimeError("MAX_CONCURRENT_POSITIONS must be >= 1")
-    _require_range("MIN_TRADE_CONFIDENCE", risk.min_trade_confidence, 0, 1)
+        low, high = RISK_BOUNDS[label]
+        _require_range(label, value, low, high)
 
     api_port = int(_get_int("APP_PORT", _get_int("API_PORT", 3000)) or 3000)
     if api_port < 1 or api_port > 65535:

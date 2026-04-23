@@ -23,6 +23,11 @@ from src.utils.state_persistence import load_risk_state, save_risk_state
 class RiskManager:
     """Enforces risk limits on every trade before execution."""
 
+    MIN_ENTRY_NOTIONAL_USD = 11.0
+    CORRELATED_BASKETS: dict[str, set[str]] = {
+        "majors": {"BTC", "ETH", "SOL"},
+    }
+
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         self.max_position_pct = self.settings.risk.max_position_pct
@@ -30,6 +35,9 @@ class RiskManager:
         self.max_leverage = self.settings.risk.max_leverage
         self.min_trade_confidence = self.settings.risk.min_trade_confidence
         self.max_total_exposure_pct = self.settings.risk.max_total_exposure_pct
+        self.max_correlated_basket_exposure_pct = (
+            self.settings.risk.max_correlated_basket_exposure_pct
+        )
         self.daily_loss_circuit_breaker_pct = (
             self.settings.risk.daily_loss_circuit_breaker_pct
         )
@@ -95,15 +103,16 @@ class RiskManager:
         return True, ""
 
     def check_total_exposure(
-        self, positions: list[dict], new_alloc: float, account_value: float
+        self,
+        positions: list[dict],
+        pending_entry_orders: list[dict],
+        new_alloc: float,
+        account_value: float,
     ) -> tuple[bool, str]:
         """Sum of all position notionals + new allocation cannot exceed max_total_exposure_pct."""
-        current_exposure = 0.0
-        for pos in positions:
-            qty = abs(float(pos.get("quantity") or pos.get("szi") or 0))
-            entry = float(pos.get("entry_price") or pos.get("entryPx") or 0)
-            current_exposure += qty * entry
-        total = current_exposure + new_alloc
+        current_exposure = sum(self._position_notional(pos) for pos in positions)
+        pending_exposure = sum(self._pending_order_notional(order) for order in pending_entry_orders)
+        total = current_exposure + pending_exposure + new_alloc
         max_exposure = account_value * (self.max_total_exposure_pct / 100.0)
         if total > max_exposure:
             return False, (
@@ -150,13 +159,132 @@ class RiskManager:
                 )
         return True, ""
 
-    def check_concurrent_positions(self, current_count: int) -> tuple[bool, str]:
-        """Limit number of simultaneous open positions."""
-        if current_count >= self.max_concurrent_positions:
+    def check_concurrent_positions(
+        self,
+        current_assets: set[str],
+        pending_assets: set[str],
+        new_asset: str,
+    ) -> tuple[bool, str]:
+        """Limit simultaneous exposure from positions plus pending entry orders."""
+        combined = {asset for asset in (current_assets | pending_assets | {new_asset}) if asset}
+        if len(combined) > self.max_concurrent_positions:
             return False, (
-                f"Already at max concurrent positions ({self.max_concurrent_positions})"
+                f"Asset concurrency {len(combined)} exceeds max "
+                f"{self.max_concurrent_positions}"
             )
         return True, ""
+
+    def check_correlated_basket_exposure(
+        self,
+        positions: list[dict],
+        pending_entry_orders: list[dict],
+        new_asset: str,
+        new_alloc: float,
+        account_value: float,
+    ) -> tuple[bool, str]:
+        """Cap exposure concentrated in highly correlated baskets."""
+        if account_value <= 0:
+            return False, "Account value is zero or negative"
+
+        by_asset: dict[str, float] = {}
+        for pos in positions:
+            coin = str(pos.get("coin") or pos.get("symbol") or "")
+            if not coin:
+                continue
+            by_asset[coin] = by_asset.get(coin, 0.0) + self._position_notional(pos)
+        for order in pending_entry_orders:
+            coin = str(order.get("coin") or order.get("asset") or "")
+            if not coin:
+                continue
+            by_asset[coin] = by_asset.get(coin, 0.0) + self._pending_order_notional(order)
+        if new_asset:
+            by_asset[new_asset] = by_asset.get(new_asset, 0.0) + max(new_alloc, 0.0)
+
+        max_bucket = account_value * (self.max_correlated_basket_exposure_pct / 100.0)
+        for basket_name, basket_assets in self.CORRELATED_BASKETS.items():
+            basket_notional = sum(by_asset.get(asset, 0.0) for asset in basket_assets)
+            if basket_notional > max_bucket:
+                assets_csv = ", ".join(sorted(basket_assets))
+                return False, (
+                    f"Correlated basket '{basket_name}' ({assets_csv}) exposure "
+                    f"${basket_notional:.2f} exceeds "
+                    f"{self.max_correlated_basket_exposure_pct}% cap (${max_bucket:.2f})"
+                )
+        return True, ""
+
+    def get_entry_orders_to_cancel(self, account_state: dict) -> list[dict[str, Any]]:
+        """Return pending entry orders that must be canceled to satisfy risk limits."""
+        pending = list(account_state.get("pending_entry_orders") or [])
+        if not pending:
+            return []
+        if self.circuit_breaker_active:
+            return pending
+
+        account_value = float(account_state.get("total_value", 0) or 0)
+        if account_value <= 0:
+            return pending
+
+        positions = list(account_state.get("positions") or [])
+        max_exposure = account_value * (self.max_total_exposure_pct / 100.0)
+        current_exposure = sum(self._position_notional(pos) for pos in positions)
+        active_assets = {
+            str(pos.get("coin") or pos.get("symbol") or "")
+            for pos in positions
+            if abs(float(pos.get("szi") or pos.get("quantity") or 0)) > 0
+        }
+
+        keep: list[dict[str, Any]] = []
+        cancel: list[dict[str, Any]] = []
+        queued_assets: set[str] = set()
+        running_exposure = current_exposure
+
+        for order in pending:
+            order_asset = str(order.get("coin") or order.get("asset") or "")
+            order_notional = self._pending_order_notional(order)
+            candidate_assets = {asset for asset in (active_assets | queued_assets | {order_asset}) if asset}
+            if running_exposure + order_notional > max_exposure:
+                cancel.append(order)
+                continue
+            if len(candidate_assets) > self.max_concurrent_positions:
+                cancel.append(order)
+                continue
+            keep.append(order)
+            queued_assets.add(order_asset)
+            running_exposure += order_notional
+
+        del keep
+        return cancel
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _position_notional(self, position: dict[str, Any]) -> float:
+        explicit = self._safe_float(
+            position.get("position_value")
+            or position.get("positionValue")
+            or position.get("notional_current")
+            or position.get("notional")
+        )
+        if explicit is not None:
+            return abs(explicit)
+
+        qty = abs(self._safe_float(position.get("quantity") or position.get("szi") or 0) or 0.0)
+        mark = self._safe_float(position.get("markPx") or position.get("mark_price") or position.get("current_price"))
+        entry = self._safe_float(position.get("entry_price") or position.get("entryPx") or 0)
+        px = mark if mark and mark > 0 else (entry or 0.0)
+        return qty * px
+
+    def _pending_order_notional(self, order: dict[str, Any]) -> float:
+        explicit = self._safe_float(order.get("notional") or order.get("notional_usd"))
+        if explicit is not None:
+            return max(explicit, 0.0)
+        size = abs(self._safe_float(order.get("sz") or order.get("size") or 0) or 0.0)
+        px = self._safe_float(order.get("px") or order.get("price") or order.get("limit_price")) or 0.0
+        return size * px
 
     def check_balance_reserve(self, balance: float, account_value: float) -> tuple[bool, str]:
         """Don't trade if balance falls below reserve threshold of CURRENT account value.
@@ -354,6 +482,14 @@ class RiskManager:
         if action == "hold":
             return True, "", trade
 
+        order_type = str(trade.get("order_type") or "market").lower()
+        if order_type == "limit":
+            return (
+                False,
+                "Resting limit entry orders are disabled in fail-closed risk mode",
+                trade,
+            )
+
         # --- Confidence check ---
         raw_conf = trade.get("confidence")
         confidence: float | None = None
@@ -372,19 +508,37 @@ class RiskManager:
         raw_lev = trade.get("leverage") or trade.get("requested_leverage")
         trade = {**trade, "leverage": self.sanitize_requested_leverage(raw_lev)}
 
+        account_value = float(account_state.get("total_value", 0) or 0)
+        balance = float(account_state.get("balance", 0) or 0)
+        positions = list(account_state.get("positions") or [])
+        pending_entry_orders = list(account_state.get("pending_entry_orders") or [])
+
         # --- Allocation floor ---
         alloc_usd = float(trade.get("allocation_usd", 0))
         if alloc_usd <= 0:
             return False, "Zero or negative allocation", trade
-        if alloc_usd < 11.0:
-            alloc_usd = 11.0
-            trade = {**trade, "allocation_usd": alloc_usd}
-            logging.info("RISK: Bumped allocation to $11 (Hyperliquid $10 minimum)")
 
-        account_value = float(account_state.get("total_value", 0))
-        balance = float(account_state.get("balance", 0))
-        positions = account_state.get("positions", [])
+        max_alloc_from_position_cap = account_value * (self.max_position_pct / 100.0)
+        if max_alloc_from_position_cap < self.MIN_ENTRY_NOTIONAL_USD:
+            return (
+                False,
+                (
+                    f"Position cap allows only ${max_alloc_from_position_cap:.2f}, below "
+                    f"minimum executable ${self.MIN_ENTRY_NOTIONAL_USD:.2f}; trade rejected"
+                ),
+                trade,
+            )
+
+        if alloc_usd < self.MIN_ENTRY_NOTIONAL_USD:
+            alloc_usd = self.MIN_ENTRY_NOTIONAL_USD
+            trade = {**trade, "allocation_usd": alloc_usd}
+            logging.info(
+                "RISK: Raised allocation to minimum executable notional $%.2f",
+                self.MIN_ENTRY_NOTIONAL_USD,
+            )
+
         is_buy = action == "buy"
+        asset = str(trade.get("asset") or "")
 
         # 1. Daily drawdown circuit breaker
         ok, reason = self.check_daily_drawdown(account_value)
@@ -396,10 +550,19 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
-        # 3. Position size — cap instead of reject
+        # 3. Position size — cap when safe, otherwise reject
         ok, reason = self.check_position_size(alloc_usd, account_value)
         if not ok:
-            max_alloc = max(account_value * (self.max_position_pct / 100.0), 11.0)
+            max_alloc = account_value * (self.max_position_pct / 100.0)
+            if max_alloc < self.MIN_ENTRY_NOTIONAL_USD:
+                return (
+                    False,
+                    (
+                        f"Position cap allows only ${max_alloc:.2f}, below minimum executable "
+                        f"${self.MIN_ENTRY_NOTIONAL_USD:.2f}; trade rejected"
+                    ),
+                    trade,
+                )
             logging.warning(
                 "RISK: Capping allocation from $%.2f to $%.2f", alloc_usd, max_alloc
             )
@@ -407,32 +570,54 @@ class RiskManager:
             trade = {**trade, "allocation_usd": alloc_usd}
 
         # 4. Total exposure
-        ok, reason = self.check_total_exposure(positions, alloc_usd, account_value)
+        ok, reason = self.check_total_exposure(
+            positions,
+            pending_entry_orders,
+            alloc_usd,
+            account_value,
+        )
         if not ok:
             return False, reason, trade
 
-        # 5. Implicit leverage (notional vs equity)
+        # 5. Correlated basket concentration
+        ok, reason = self.check_correlated_basket_exposure(
+            positions,
+            pending_entry_orders,
+            asset,
+            alloc_usd,
+            account_value,
+        )
+        if not ok:
+            return False, reason, trade
+
+        # 6. Implicit leverage (notional vs equity)
         ok, reason = self.check_leverage(alloc_usd, account_value)
         if not ok:
             return False, reason, trade
 
-        # 6. Concurrent positions
-        active_count = sum(
-            1 for p in positions
+        # 7. Concurrent positions + pending entry assets
+        current_assets = {
+            str(p.get("coin") or p.get("symbol") or "")
+            for p in positions
             if abs(float(p.get("szi") or p.get("quantity") or 0)) > 0
-        )
-        ok, reason = self.check_concurrent_positions(active_count)
+        }
+        pending_assets = {
+            str(o.get("coin") or o.get("asset") or "")
+            for o in pending_entry_orders
+            if self._pending_order_notional(o) > 0
+        }
+        ok, reason = self.check_concurrent_positions(current_assets, pending_assets, asset)
         if not ok:
             return False, reason, trade
 
-        # 7. Enforce SL — validate side and auto-set if missing/invalid
+        # 8. Enforce SL — validate side and auto-set if missing/invalid
         current_price = float(trade.get("current_price", 0))
         entry_price = current_price if current_price > 0 else 1.0
         sl_price = trade.get("sl_price")
         validated_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy)
         trade = {**trade, "sl_price": validated_sl}
 
-        # 8. Enforce TP — validate side; clear if invalid rather than sending wrong order
+        # 9. Enforce TP — validate side; clear if invalid rather than sending wrong order
         tp_price = trade.get("tp_price")
         validated_tp = self.enforce_take_profit(tp_price, entry_price, is_buy)
         trade = {**trade, "tp_price": validated_tp}
@@ -447,9 +632,11 @@ class RiskManager:
             "max_leverage": self.max_leverage,
             "min_trade_confidence": self.min_trade_confidence,
             "max_total_exposure_pct": self.max_total_exposure_pct,
+            "max_correlated_basket_exposure_pct": self.max_correlated_basket_exposure_pct,
             "daily_loss_circuit_breaker_pct": self.daily_loss_circuit_breaker_pct,
             "mandatory_sl_pct": self.mandatory_sl_pct,
             "max_concurrent_positions": self.max_concurrent_positions,
             "min_balance_reserve_pct": self.min_balance_reserve_pct,
+            "min_entry_notional_usd": self.MIN_ENTRY_NOTIONAL_USD,
             "circuit_breaker_active": self.circuit_breaker_active,
         }

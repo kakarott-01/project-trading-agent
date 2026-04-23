@@ -189,11 +189,63 @@ class ExecutionService:
         asset = adjusted_intent.asset
         alloc_usd = adjusted_intent.allocation_usd
         leverage = float(adjusted_intent.leverage or 1.0)
+        if adjusted_intent.order_type == "limit":
+            logging.error(
+                "Blocked %s: limit entry orders are disabled in fail-closed risk mode",
+                asset,
+            )
+            self._append_diary(
+                {
+                    "timestamp": cycle_start.isoformat(),
+                    "asset": asset,
+                    "action": "risk_blocked",
+                    "source": adjusted_intent.source,
+                    "reason": "Limit entry orders are disabled in fail-closed risk mode",
+                }
+            )
+            return
+
         amount = alloc_usd / current_price
+        amount = self._round_order_amount(asset, amount)
+        rounded_alloc = amount * current_price
+        if amount <= 0 or rounded_alloc <= 0:
+            logging.error("Rounded order amount became non-positive for %s", asset)
+            return
+
+        if abs(rounded_alloc - alloc_usd) > 0.01:
+            rounded_trade = adjusted_intent.to_dict()
+            rounded_trade["allocation_usd"] = rounded_alloc
+            allowed_after_rounding, reason_after_rounding, rounded_adjusted = self.risk_manager.validate_trade(
+                rounded_trade,
+                fresh_state,
+                0,
+            )
+            if not allowed_after_rounding:
+                logging.warning(
+                    "RISK BLOCKED %s after size-rounding recheck: %s",
+                    asset,
+                    reason_after_rounding,
+                )
+                self._append_diary(
+                    {
+                        "timestamp": cycle_start.isoformat(),
+                        "asset": asset,
+                        "action": "risk_blocked",
+                        "source": adjusted_intent.source,
+                        "reason": f"Rounding recheck failed: {reason_after_rounding}",
+                    }
+                )
+                return
+
+            adjusted_intent = TradeIntent.from_dict(rounded_adjusted)
+            alloc_usd = adjusted_intent.allocation_usd
+            amount = self._round_order_amount(asset, alloc_usd / current_price)
+            rounded_alloc = amount * current_price
+
         is_buy = adjusted_intent.action == "buy"
 
         lev_result = await self.broker.set_leverage(asset, leverage, is_cross=True)
-        if not self._is_ok_response(lev_result):
+        if not self._is_successful_leverage_update(lev_result):
             logging.error(
                 "Leverage set failed for %s (%.2fx): %s",
                 asset,
@@ -207,6 +259,7 @@ class ExecutionService:
                     "action": "leverage_failed",
                     "source": adjusted_intent.source,
                     "leverage": leverage,
+                    "raw_result": lev_result,
                 }
             )
             return
@@ -242,48 +295,25 @@ class ExecutionService:
         save_active_trades([trade.to_dict() for trade in active_trades])
 
         try:
-            if adjusted_intent.order_type == "limit" and adjusted_intent.limit_price:
-                if is_buy:
-                    order_result = await self.broker.place_limit_buy(
-                        asset,
-                        amount,
-                        float(adjusted_intent.limit_price),
-                        cloid_raw=client_order_id,
-                    )
-                else:
-                    order_result = await self.broker.place_limit_sell(
-                        asset,
-                        amount,
-                        float(adjusted_intent.limit_price),
-                        cloid_raw=client_order_id,
-                    )
-                logging.info(
-                    "LIMIT %s %s  amount=%.6f  price=$%.4f",
-                    adjusted_intent.action.upper(),
+            if is_buy:
+                order_result = await self.broker.place_buy_order(
                     asset,
                     amount,
-                    float(adjusted_intent.limit_price),
+                    cloid_raw=client_order_id,
                 )
             else:
-                if is_buy:
-                    order_result = await self.broker.place_buy_order(
-                        asset,
-                        amount,
-                        cloid_raw=client_order_id,
-                    )
-                else:
-                    order_result = await self.broker.place_sell_order(
-                        asset,
-                        amount,
-                        cloid_raw=client_order_id,
-                    )
-                logging.info(
-                    "%s %s  amount=%.6f  at ~$%.4f",
-                    adjusted_intent.action.upper(),
+                order_result = await self.broker.place_sell_order(
                     asset,
                     amount,
-                    current_price,
+                    cloid_raw=client_order_id,
                 )
+            logging.info(
+                "%s %s  amount=%.6f  at ~$%.4f",
+                adjusted_intent.action.upper(),
+                asset,
+                amount,
+                current_price,
+            )
         except Exception as exc:
             logging.error(
                 "Order submission for %s became ambiguous; keeping pending record for reconciliation: %s",
@@ -334,6 +364,28 @@ class ExecutionService:
             )
             return
 
+        if synced_trade.status == "open_position" and not synced_trade.sl_oid:
+            logging.error(
+                "Entry %s rejected as unprotected: live position has no confirmed SL order",
+                asset,
+            )
+            await self._emergency_flatten_unprotected_position(
+                asset=asset,
+                size=abs(float(synced_trade.actual_filled or synced_trade.amount or 0.0)),
+                cycle_start=cycle_start,
+                source=adjusted_intent.source,
+            )
+            self._append_diary(
+                {
+                    "timestamp": cycle_start.isoformat(),
+                    "asset": asset,
+                    "action": "entry_unprotected_after_fill",
+                    "source": adjusted_intent.source,
+                    "status": synced_trade.status,
+                }
+            )
+            return
+
         trade_log.append(
             {
                 "type": adjusted_intent.action,
@@ -352,7 +404,7 @@ class ExecutionService:
                 "source": adjusted_intent.source,
                 "order_type": synced_trade.order_type,
                 "limit_price": synced_trade.limit_price,
-                "allocation_usd": alloc_usd,
+                "allocation_usd": rounded_alloc,
                 "amount": synced_trade.amount,
                 "actual_filled": synced_trade.actual_filled,
                 "entry_price": synced_trade.entry_price,
@@ -369,6 +421,10 @@ class ExecutionService:
                 "rationale": adjusted_intent.rationale,
             }
         )
+
+        if synced_trade.status == "failed_no_stop":
+            logging.error("Entry %s fail-closed: position was flattened due to missing SL", asset)
+            return
 
     async def _close_existing_position(
         self,
@@ -466,8 +522,27 @@ class ExecutionService:
         ]
 
     @staticmethod
-    def _is_ok_response(result: Any) -> bool:
-        return isinstance(result, dict) and result.get("status") == "ok"
+    def _is_successful_leverage_update(result: Any) -> bool:
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return False
+        statuses = (
+            result.get("response", {})
+            .get("data", {})
+            .get("statuses")
+        )
+        if not isinstance(statuses, list):
+            return True
+        return not any(isinstance(entry, dict) and entry.get("error") for entry in statuses)
+
+    def _round_order_amount(self, asset: str, amount: float) -> float:
+        try:
+            round_size = getattr(self.broker, "round_size", None)
+            if callable(round_size):
+                rounded = float(round_size(asset, amount))
+                return max(rounded, 0.0)
+        except Exception as exc:
+            logging.warning("Could not pre-round amount for %s: %s", asset, exc)
+        return max(float(amount), 0.0)
 
     @staticmethod
     def _safe_float(value: Any) -> float | None:
@@ -475,6 +550,38 @@ class ExecutionService:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    async def _emergency_flatten_unprotected_position(
+        self,
+        asset: str,
+        size: float,
+        cycle_start: datetime,
+        source: str,
+    ) -> None:
+        if size <= 0:
+            return
+        close_cloid = self.broker.generate_client_order_id()
+        try:
+            await self.broker.cancel_all_orders(asset)
+            await self.broker.close_position_market(
+                asset,
+                amount=size,
+                cloid_raw=close_cloid,
+            )
+            logging.error("Emergency fail-closed flatten submitted for %s", asset)
+        except Exception as exc:
+            logging.error("Emergency fail-closed flatten failed for %s: %s", asset, exc)
+
+        self._append_diary(
+            {
+                "timestamp": cycle_start.isoformat(),
+                "asset": asset,
+                "action": "emergency_fail_closed_flatten",
+                "source": source,
+                "requested_size": size,
+                "client_order_id": close_cloid,
+            }
+        )
 
     @staticmethod
     def _get_active_trade(
