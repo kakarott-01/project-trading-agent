@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from src.config_loader import CONFIG
+from src.config import Settings, get_settings
 
 
 REQUIRED_ALGO_FUNCTION = "generate_trade_decisions"
@@ -20,8 +20,13 @@ REQUIRED_ALGO_FUNCTION = "generate_trade_decisions"
 class AlgoTradingAgent:
     """Create trading decisions from user algo.py or built-in fallback rules."""
 
-    def __init__(self, algo_file_path: str | None = None):
-        configured_path = algo_file_path or str(CONFIG.get("algo_file_path") or "algo.py")
+    def __init__(
+        self,
+        algo_file_path: str | None = None,
+        settings: Settings | None = None,
+    ):
+        self.settings = settings or get_settings()
+        configured_path = algo_file_path or self.settings.execution.algo_file_path
         self.algo_file_path = configured_path
         self.custom_algo = self._load_custom_algo(configured_path)
 
@@ -56,9 +61,7 @@ class AlgoTradingAgent:
 
     def _load_custom_algo(self, algo_file_path: str):
         """Load a custom algorithm function from a local Python file."""
-        path = Path(algo_file_path).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
+        path = self.settings.resolve_algo_path(Path.cwd(), algo_file_path=algo_file_path)
         if not path.exists():
             logging.info("Custom algo file not found at %s; using built-in algo", path)
             return None
@@ -91,7 +94,7 @@ class AlgoTradingAgent:
         """Normalize custom strategy output to the engine's expected schema."""
         reasoning = ""
         decisions_raw: list[dict] = []
-        max_leverage = float(CONFIG.get("max_leverage") or 10)
+        max_leverage = self.settings.risk.max_leverage
 
         if isinstance(raw_output, dict):
             reasoning = str(raw_output.get("reasoning") or "")
@@ -204,7 +207,7 @@ class AlgoTradingAgent:
 
     def _decision_for_asset(self, asset: str, section: dict | None) -> dict[str, Any]:
         """Build a single-asset decision from computed indicator snapshots."""
-        max_leverage = float(CONFIG.get("max_leverage") or 10)
+        max_leverage = self.settings.risk.max_leverage
         base = {
             "asset": asset,
             "action": "hold",

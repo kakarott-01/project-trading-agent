@@ -4,15 +4,17 @@ import requests
 import os
 import time
 import logging
-from src.config_loader import CONFIG
+
+from src.config import Settings, get_settings
 
 
 class TAAPIClient:
     """Fetches TA indicators with retry/backoff semantics for resilience."""
 
-    def __init__(self):
+    def __init__(self, settings: Settings | None = None):
         """Initialize TAAPI credentials and base URL."""
-        self.api_key = CONFIG["taapi_api_key"]
+        self.settings = settings or get_settings()
+        self.api_key = self.settings.legacy.taapi_api_key
         self.base_url = "https://api.taapi.io/"
 
     def _get_with_retry(self, url, params, retries=3, backoff=0.5):

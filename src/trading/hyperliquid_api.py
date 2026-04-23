@@ -10,7 +10,6 @@ import asyncio
 import logging
 import aiohttp
 from typing import TYPE_CHECKING
-from src.config_loader import CONFIG
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants  # For MAINNET/TESTNET
@@ -18,6 +17,8 @@ from eth_account import Account as _Account
 from eth_account.signers.local import LocalAccount
 from websocket._exceptions import WebSocketConnectionClosedException
 import socket
+
+from src.config import Settings, get_settings
 
 if TYPE_CHECKING:
     # Type stubs for linter - eth_account's type stubs are incorrect
@@ -39,25 +40,26 @@ class HyperliquidAPI:
     the trading agent.
     """
 
-    def __init__(self):
+    def __init__(self, settings: Settings | None = None):
         """Initialize wallet credentials and instantiate exchange clients.
 
         Raises:
             ValueError: If neither a private key nor mnemonic is present in the
                 configuration.
         """
+        self.settings = settings or get_settings()
         self._meta_cache = None
         self._hip3_meta_cache = {}  # {dex_name: meta_response}
-        if "hyperliquid_private_key" in CONFIG and CONFIG["hyperliquid_private_key"]:
-            self.wallet = Account.from_key(CONFIG["hyperliquid_private_key"])
-        elif "mnemonic" in CONFIG and CONFIG["mnemonic"]:
+        if self.settings.hyperliquid.private_key:
+            self.wallet = Account.from_key(self.settings.hyperliquid.private_key)
+        elif self.settings.hyperliquid.mnemonic:
             Account.enable_unaudited_hdwallet_features()
-            self.wallet = Account.from_mnemonic(CONFIG["mnemonic"])
+            self.wallet = Account.from_mnemonic(self.settings.hyperliquid.mnemonic)
         else:
             raise ValueError("Either HYPERLIQUID_PRIVATE_KEY/LIGHTER_PRIVATE_KEY or MNEMONIC must be provided")
         # Choose base URL: allow override via env-config; fallback to network selection
-        network = (CONFIG.get("hyperliquid_network") or "mainnet").lower()
-        base_url = CONFIG.get("hyperliquid_base_url")
+        network = self.settings.hyperliquid.network
+        base_url = self.settings.hyperliquid.base_url
         if not base_url:
             if network == "testnet":
                 base_url = getattr(constants, "TESTNET_API_URL", constants.MAINNET_API_URL)
@@ -66,7 +68,7 @@ class HyperliquidAPI:
         self.base_url = base_url
         # Account address: the main wallet that holds funds.
         # The agent wallet (private key) is just the authorized signer.
-        self.account_address = CONFIG.get("hyperliquid_vault_address")
+        self.account_address = self.settings.hyperliquid.vault_address
         # The address to query for state — main account if set, otherwise the signer
         self.query_address = self.account_address or self.wallet.address
         self._build_clients()

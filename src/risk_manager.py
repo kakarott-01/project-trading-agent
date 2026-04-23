@@ -16,23 +16,26 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from src.config_loader import CONFIG
+from src.config import Settings, get_settings
 from src.utils.state_persistence import load_risk_state, save_risk_state
 
 
 class RiskManager:
     """Enforces risk limits on every trade before execution."""
 
-    def __init__(self):
-        self.max_position_pct = float(CONFIG.get("max_position_pct") or 10)
-        self.max_loss_per_position_pct = float(CONFIG.get("max_loss_per_position_pct") or 20)
-        self.max_leverage = float(CONFIG.get("max_leverage") or 10)
-        self.min_trade_confidence = float(CONFIG.get("min_trade_confidence") or 0.55)
-        self.max_total_exposure_pct = float(CONFIG.get("max_total_exposure_pct") or 50)
-        self.daily_loss_circuit_breaker_pct = float(CONFIG.get("daily_loss_circuit_breaker_pct") or 10)
-        self.mandatory_sl_pct = float(CONFIG.get("mandatory_sl_pct") or 5)
-        self.max_concurrent_positions = int(CONFIG.get("max_concurrent_positions") or 10)
-        self.min_balance_reserve_pct = float(CONFIG.get("min_balance_reserve_pct") or 20)
+    def __init__(self, settings: Settings | None = None):
+        self.settings = settings or get_settings()
+        self.max_position_pct = self.settings.risk.max_position_pct
+        self.max_loss_per_position_pct = self.settings.risk.max_loss_per_position_pct
+        self.max_leverage = self.settings.risk.max_leverage
+        self.min_trade_confidence = self.settings.risk.min_trade_confidence
+        self.max_total_exposure_pct = self.settings.risk.max_total_exposure_pct
+        self.daily_loss_circuit_breaker_pct = (
+            self.settings.risk.daily_loss_circuit_breaker_pct
+        )
+        self.mandatory_sl_pct = self.settings.risk.mandatory_sl_pct
+        self.max_concurrent_positions = self.settings.risk.max_concurrent_positions
+        self.min_balance_reserve_pct = self.settings.risk.min_balance_reserve_pct
 
         # Daily tracking — load persisted state so restarts don't reset the breaker
         self.circuit_breaker_active = False

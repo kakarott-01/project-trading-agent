@@ -8,7 +8,7 @@ import json
 import logging
 from datetime import datetime
 
-from src.config_loader import CONFIG
+from src.config import Settings, get_settings
 from src.indicators.local_indicators import compute_all, last_n, latest
 
 
@@ -17,17 +17,18 @@ class TradingAgent:
 
     SUPPORTED_PROVIDERS = {"anthropic", "openai", "gemini"}
 
-    def __init__(self, hyperliquid=None):
-        self.provider = (CONFIG.get("llm_provider") or "anthropic").strip().lower()
+    def __init__(self, hyperliquid=None, settings: Settings | None = None):
+        self.settings = settings or get_settings()
+        self.provider = self.settings.ai.provider
         if self.provider not in self.SUPPORTED_PROVIDERS:
             raise ValueError(
                 f"Unsupported AI provider '{self.provider}'. Supported: {sorted(self.SUPPORTED_PROVIDERS)}"
             )
 
-        self.model = CONFIG["llm_model"]
-        self.sanitize_model = CONFIG.get("sanitize_model") or self.model
-        self.max_tokens = int(CONFIG.get("max_tokens") or 4096)
-        self.enable_tool_calling = bool(CONFIG.get("enable_tool_calling", False))
+        self.model = self.settings.ai.model
+        self.sanitize_model = self.settings.ai.sanitize_model or self.model
+        self.max_tokens = self.settings.ai.max_tokens
+        self.enable_tool_calling = self.settings.ai.enable_tool_calling
         self.hyperliquid = hyperliquid
 
         self.anthropic_client = None
@@ -35,14 +36,18 @@ class TradingAgent:
         self.gemini_client = None
 
         if self.provider == "anthropic":
-            self.anthropic_client = self._build_anthropic_client(CONFIG.get("anthropic_api_key"))
+            self.anthropic_client = self._build_anthropic_client(
+                self.settings.ai.anthropic_api_key
+            )
         elif self.provider == "openai":
             self.openai_client = self._build_openai_client(
-                CONFIG.get("openai_api_key"),
-                CONFIG.get("openai_base_url"),
+                self.settings.ai.openai_api_key,
+                self.settings.ai.openai_base_url,
             )
         elif self.provider == "gemini":
-            self.gemini_client = self._build_gemini_client(CONFIG.get("gemini_api_key"))
+            self.gemini_client = self._build_gemini_client(
+                self.settings.ai.gemini_api_key
+            )
 
     @staticmethod
     def _build_anthropic_client(api_key):
@@ -373,10 +378,10 @@ class TradingAgent:
             }
             if use_tools and self.enable_tool_calling:
                 kwargs["tools"] = tools
-            if CONFIG.get("thinking_enabled"):
+            if self.settings.ai.thinking_enabled:
                 kwargs["thinking"] = {
                     "type": "enabled",
-                    "budget_tokens": int(CONFIG.get("thinking_budget_tokens") or 10000),
+                    "budget_tokens": self.settings.ai.thinking_budget_tokens,
                 }
                 kwargs["max_tokens"] = max(self.max_tokens, 16000)
 
