@@ -13,19 +13,6 @@ from src.indicators.local_indicators import compute_all, last_n, latest
 from src.utils.prompt_utils import round_or_none, round_series
 
 
-def calculate_sharpe(returns: list[dict]) -> float:
-    if not returns:
-        return 0.0
-    vals = [entry.get("pnl", 0) if "pnl" in entry else 0 for entry in returns]
-    if not vals:
-        return 0.0
-    mean = sum(vals) / len(vals)
-    var = sum((v - mean) ** 2 for v in vals) / len(vals)
-    if var <= 0:
-        return 0.0
-    return mean / (var ** 0.5)
-
-
 class MarketDataService:
     """Builds normalized market and account views for strategies and execution."""
 
@@ -110,7 +97,6 @@ class MarketDataService:
         return AccountDashboard(
             balance=round_or_none(state["balance"], 2) or 0.0,
             account_value=round_or_none(account_value, 2) or 0.0,
-            sharpe_ratio=round_or_none(calculate_sharpe(trade_log), 3) or 0.0,
             positions=positions,
             active_trades=active_trades,
             open_orders=open_orders_struct,

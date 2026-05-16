@@ -12,8 +12,6 @@ from dotenv import load_dotenv
 
 from src.utils.security import _SensitiveDict
 
-load_dotenv()
-
 
 # Immutable guardrails: runtime cannot exceed these bounds even via .env overrides.
 RISK_BOUNDS = {
@@ -464,4 +462,5 @@ def _load_settings() -> Settings:
 def get_settings() -> Settings:
     """Load and cache validated settings for the current process."""
 
+    load_dotenv(override=True)
     return _load_settings()

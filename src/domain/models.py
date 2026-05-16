@@ -104,7 +104,6 @@ class ActiveTradeRecord:
 class AccountDashboard:
     balance: float
     account_value: float
-    sharpe_ratio: float
     positions: list[dict[str, Any]]
     active_trades: list[ActiveTradeRecord]
     open_orders: list[dict[str, Any]]
@@ -115,7 +114,6 @@ class AccountDashboard:
         return {
             "balance": self.balance,
             "account_value": self.account_value,
-            "sharpe_ratio": self.sharpe_ratio,
             "positions": self.positions,
             "active_trades": [trade.to_dict() for trade in self.active_trades],
             "open_orders": self.open_orders,
