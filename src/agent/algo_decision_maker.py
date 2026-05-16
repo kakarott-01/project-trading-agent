@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from src.config import Settings, get_settings
+from src.utils.risk_math import confidence_to_leverage
 
 
 REQUIRED_ALGO_FUNCTION = "generate_trade_decisions"
@@ -293,7 +294,5 @@ def _clamp_confidence(value: float | None) -> float | None:
 
 
 def _confidence_to_leverage(confidence: float, max_leverage: float) -> float:
-    """Map confidence [0,1] to leverage [1,max_leverage] with linear scaling."""
-    bounded = min(max(confidence, 0.0), 1.0)
-    lev = 1.0 + bounded * (max_leverage - 1.0)
-    return round(lev, 2)
+    """Map confidence [0,1] to leverage [1,max_leverage] with canonical curvature."""
+    return confidence_to_leverage(confidence, max_leverage)

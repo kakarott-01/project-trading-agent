@@ -19,9 +19,15 @@ from src.utils.security import (
 class ApiServer:
     """Owns the lightweight local HTTP API."""
 
-    def __init__(self, settings: Settings, diary_path: str = "diary.jsonl"):
+    def __init__(
+        self,
+        settings: Settings,
+        diary_path: str = "diary.jsonl",
+        alarm_path: str = "alarms.jsonl",
+    ):
         self.settings = settings
         self.diary_path = diary_path
+        self.alarm_path = alarm_path
         self.runner: web.AppRunner | None = None
 
     async def start(self) -> web.AppRunner:
@@ -29,6 +35,7 @@ class ApiServer:
             middlewares=[make_auth_middleware(self.settings.api.secret)]
         )
         app.router.add_get("/diary", self.handle_diary)
+        app.router.add_get("/alarms", self.handle_alarms)
         app.router.add_get("/logs", self.handle_logs)
 
         self.runner = web.AppRunner(app)
@@ -73,6 +80,33 @@ class ApiServer:
                 except json.JSONDecodeError:
                     continue
             return web.json_response({"entries": entries})
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_alarms(self, request: web.Request) -> web.Response:
+        try:
+            raw = request.query.get("raw")
+            if not os.path.exists(self.alarm_path):
+                return web.json_response({"entries": []})
+
+            with open(self.alarm_path, "r", encoding="utf-8") as handle:
+                data = handle.read(MAX_DIARY_RESPONSE_BYTES + 1)
+
+            if len(data) > MAX_DIARY_RESPONSE_BYTES:
+                data = data[-MAX_DIARY_RESPONSE_BYTES:]
+                data = data[data.index("\n") + 1 :] if "\n" in data else data
+
+            if raw:
+                return web.Response(text=data, content_type="text/plain")
+
+            limit = min(int(request.query.get("limit", "100")), 500)
+            entries = []
+            for line in data.strip().splitlines()[-limit:]:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            return web.json_response({"entries": entries, "has_critical": bool(entries)})
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
 

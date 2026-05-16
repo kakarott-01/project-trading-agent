@@ -11,6 +11,7 @@ confidence and leverage contract stable across different trader algos.
 
 from __future__ import annotations
 
+from src.utils.risk_math import confidence_to_leverage as _canonical_confidence_to_leverage
 
 MAX_LEVERAGE = 10.0
 MIN_TRADE_CONFIDENCE = 0.58
@@ -18,6 +19,11 @@ MIN_TRADE_CONFIDENCE = 0.58
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def confidence_to_leverage(confidence: float, max_leverage: float = MAX_LEVERAGE) -> float:
+    """Map confidence [0,1] to leverage [1,max_leverage] with canonical curvature."""
+    return _canonical_confidence_to_leverage(confidence, max_leverage)
 
 
 def calculate_confidence(asset_section: dict, direction: str) -> float:
@@ -67,14 +73,6 @@ def calculate_confidence(asset_section: dict, direction: str) -> float:
         - volatility_penalty
     )
     return round(_clamp(confidence, 0.0, 1.0), 4)
-
-
-def confidence_to_leverage(confidence: float, max_leverage: float = MAX_LEVERAGE) -> float:
-    """Map confidence [0,1] to leverage [1,max_leverage] with conservative curvature."""
-    bounded = _clamp(float(confidence), 0.0, 1.0)
-    curved = bounded ** 1.6
-    leverage = 1.0 + curved * (max_leverage - 1.0)
-    return round(_clamp(leverage, 1.0, max_leverage), 2)
 
 
 def _hold_decision(asset: str, reason: str, confidence: float = 0.0) -> dict:

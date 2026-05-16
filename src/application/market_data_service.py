@@ -6,6 +6,7 @@ import json
 import logging
 from collections import deque
 from datetime import datetime, timezone
+from typing import Any
 
 from src.domain.models import AccountDashboard, ActiveTradeRecord, MarketSnapshot
 from src.exchanges.base import MarketDataPort
@@ -15,6 +16,20 @@ from src.utils.prompt_utils import round_or_none, round_series
 
 class MarketDataService:
     """Builds normalized market and account views for strategies and execution."""
+
+    INTERVAL_MS = {
+        "1m": 60_000,
+        "3m": 180_000,
+        "5m": 300_000,
+        "15m": 900_000,
+        "30m": 1_800_000,
+        "1h": 3_600_000,
+        "2h": 7_200_000,
+        "4h": 14_400_000,
+        "8h": 28_800_000,
+        "12h": 43_200_000,
+        "1d": 86_400_000,
+    }
 
     def __init__(self, broker: MarketDataPort, diary_path: str = "diary.jsonl"):
         self.broker = broker
@@ -138,8 +153,18 @@ class MarketDataService:
 
                 oi = await self.broker.get_open_interest(asset)
                 funding = await self.broker.get_funding_rate(asset)
-                candles_5m = await self.broker.get_candles(asset, "5m", 100)
-                candles_4h = await self.broker.get_candles(asset, "4h", 100)
+                candles_5m = self._drop_in_progress_candle(
+                    await self.broker.get_candles(asset, "5m", 100),
+                    "5m",
+                    cycle_start,
+                    asset,
+                )
+                candles_4h = self._drop_in_progress_candle(
+                    await self.broker.get_candles(asset, "4h", 100),
+                    "4h",
+                    cycle_start,
+                    asset,
+                )
 
                 intra = compute_all(candles_5m)
                 long_term = compute_all(candles_4h)
@@ -182,3 +207,42 @@ class MarketDataService:
                 logging.error("Data gather error %s: %s", asset, exc)
 
         return snapshots, asset_prices
+
+    def _drop_in_progress_candle(
+        self,
+        candles: list[dict[str, Any]],
+        interval: str,
+        current_time: datetime,
+        asset: str,
+    ) -> list[dict[str, Any]]:
+        """Remove the latest candle if its interval has not closed yet."""
+        if not candles:
+            return candles
+
+        interval_ms = self.INTERVAL_MS.get(interval)
+        if interval_ms is None:
+            logging.warning("Unknown candle interval %s for %s; using raw candles", interval, asset)
+            return candles
+
+        last_open = self._coerce_candle_time_ms(candles[-1].get("t"))
+        if last_open is None:
+            logging.warning("Candle for %s/%s is missing timestamp; using raw candles", asset, interval)
+            return candles
+
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        current_time_ms = int(current_time.timestamp() * 1000)
+        if last_open + interval_ms > current_time_ms:
+            logging.info("Dropping in-progress %s candle for %s", interval, asset)
+            return candles[:-1]
+        return candles
+
+    @staticmethod
+    def _coerce_candle_time_ms(raw: Any) -> int | None:
+        try:
+            timestamp = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if timestamp < 10_000_000_000:
+            timestamp *= 1000
+        return timestamp

@@ -56,7 +56,13 @@ class RiskManager:
         state = load_risk_state()
         if state:
             self.circuit_breaker_active = bool(state.get("circuit_breaker_active", False))
-            self.daily_high_value = state.get("daily_high_value")
+            if state.get("daily_high_basis") == "cash_balance":
+                self.daily_high_value = state.get("daily_high_value")
+            else:
+                self.daily_high_value = None
+                logging.info(
+                    "Ignoring persisted daily high watermark from older account-value basis"
+                )
             today = datetime.now(timezone.utc).date()
             self.daily_high_date = today
             if self.circuit_breaker_active:
@@ -71,19 +77,20 @@ class RiskManager:
             "date": datetime.now(timezone.utc).date().isoformat(),
             "circuit_breaker_active": self.circuit_breaker_active,
             "daily_high_value": self.daily_high_value,
+            "daily_high_basis": "cash_balance",
         })
 
-    def _reset_daily_if_needed(self, account_value: float) -> None:
-        """Reset daily high watermark at UTC day boundary."""
+    def _reset_daily_if_needed(self, reference_value: float) -> None:
+        """Reset daily cash-balance high watermark at UTC day boundary."""
         today = datetime.now(timezone.utc).date()
         if self.daily_high_date != today:
-            self.daily_high_value = account_value
+            self.daily_high_value = reference_value
             self.daily_high_date = today
             self.circuit_breaker_active = False
             self.circuit_breaker_date = None
             self._persist_state()
-        elif self.daily_high_value is None or account_value > self.daily_high_value:
-            self.daily_high_value = account_value
+        elif self.daily_high_value is None or reference_value > self.daily_high_value:
+            self.daily_high_value = reference_value
             self._persist_state()
 
     # ------------------------------------------------------------------
@@ -140,21 +147,24 @@ class RiskManager:
             )
         return True, ""
 
-    def check_daily_drawdown(self, account_value: float) -> tuple[bool, str]:
-        """Activate circuit breaker if account drops max % from daily high."""
-        self._reset_daily_if_needed(account_value)
+    def check_daily_drawdown(
+        self, account_value: float, balance: float | None = None
+    ) -> tuple[bool, str]:
+        """Activate circuit breaker if cash balance drops max % from daily high."""
+        reference_value = balance if balance is not None and balance > 0 else account_value
+        self._reset_daily_if_needed(reference_value)
         if self.circuit_breaker_active:
             return False, "Daily loss circuit breaker is active — no new trades until tomorrow (UTC)"
         if self.daily_high_value and self.daily_high_value > 0:
             drawdown_pct = (
-                (self.daily_high_value - account_value) / self.daily_high_value * 100
+                (self.daily_high_value - reference_value) / self.daily_high_value * 100
             )
             if drawdown_pct >= self.daily_loss_circuit_breaker_pct:
                 self.circuit_breaker_active = True
                 self.circuit_breaker_date = datetime.now(timezone.utc).date()
                 self._persist_state()
                 return False, (
-                    f"Daily drawdown {drawdown_pct:.2f}% exceeds circuit breaker "
+                    f"Daily cash-balance drawdown {drawdown_pct:.2f}% exceeds circuit breaker "
                     f"threshold of {self.daily_loss_circuit_breaker_pct}%"
                 )
         return True, ""
@@ -280,10 +290,20 @@ class RiskManager:
 
     def _pending_order_notional(self, order: dict[str, Any]) -> float:
         explicit = self._safe_float(order.get("notional") or order.get("notional_usd"))
-        if explicit is not None:
-            return max(explicit, 0.0)
+        if explicit is not None and explicit > 0:
+            return explicit
         size = abs(self._safe_float(order.get("sz") or order.get("size") or 0) or 0.0)
         px = self._safe_float(order.get("px") or order.get("price") or order.get("limit_price")) or 0.0
+        if px <= 0:
+            px = (
+                self._safe_float(
+                    order.get("mark_price")
+                    or order.get("markPx")
+                    or order.get("current_price")
+                    or order.get("currentPrice")
+                )
+                or 0.0
+            )
         return size * px
 
     def check_balance_reserve(self, balance: float, account_value: float) -> tuple[bool, str]:
@@ -378,6 +398,21 @@ class RiskManager:
             )
             return auto_sl
 
+        # Mandatory SL is also a max-loss guard. Tighten stops that drifted too
+        # far from actual fill price because execution slipped from quote time.
+        if is_buy and sl_price < auto_sl:
+            logging.warning(
+                "RISK: SL %.6f is wider than mandatory %.1f%% from entry %.6f; using %.6f",
+                sl_price, self.mandatory_sl_pct, entry_price, auto_sl,
+            )
+            return auto_sl
+        if not is_buy and sl_price > auto_sl:
+            logging.warning(
+                "RISK: SL %.6f is wider than mandatory %.1f%% from entry %.6f; using %.6f",
+                sl_price, self.mandatory_sl_pct, entry_price, auto_sl,
+            )
+            return auto_sl
+
         # SL must not be so tight it fires immediately on spread (< 0.01% from entry)
         min_distance = entry_price * 0.0001
         actual_distance = abs(entry_price - sl_price)
@@ -439,11 +474,22 @@ class RiskManager:
             if notional == 0:
                 continue
 
-            loss_pct = abs(pnl / notional) * 100 if pnl < 0 else 0.0
+            leverage_payload = pos.get("leverage") or {}
+            leverage_value = (
+                leverage_payload.get("value")
+                if isinstance(leverage_payload, dict)
+                else leverage_payload
+            )
+            leverage = abs(float(leverage_value or 1.0))
+            margin = notional / max(leverage, 1.0)
+            if margin == 0:
+                continue
+
+            loss_pct = abs(pnl / margin) * 100 if pnl < 0 else 0.0
 
             if loss_pct >= self.max_loss_per_position_pct:
                 logging.warning(
-                    "RISK: Force-closing %s — loss %.2f%% exceeds max %.2f%%",
+                    "RISK: Force-closing %s — margin loss %.2f%% exceeds max %.2f%%",
                     coin, loss_pct, self.max_loss_per_position_pct,
                 )
                 to_close.append({
@@ -541,7 +587,7 @@ class RiskManager:
         asset = str(trade.get("asset") or "")
 
         # 1. Daily drawdown circuit breaker
-        ok, reason = self.check_daily_drawdown(account_value)
+        ok, reason = self.check_daily_drawdown(account_value, balance)
         if not ok:
             return False, reason, trade
 
@@ -634,6 +680,7 @@ class RiskManager:
             "max_total_exposure_pct": self.max_total_exposure_pct,
             "max_correlated_basket_exposure_pct": self.max_correlated_basket_exposure_pct,
             "daily_loss_circuit_breaker_pct": self.daily_loss_circuit_breaker_pct,
+            "daily_loss_basis": "cash_balance_high_watermark",
             "mandatory_sl_pct": self.mandatory_sl_pct,
             "max_concurrent_positions": self.max_concurrent_positions,
             "min_balance_reserve_pct": self.min_balance_reserve_pct,

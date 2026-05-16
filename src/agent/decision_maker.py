@@ -3,13 +3,11 @@
 Supports one active provider at a time: Anthropic, OpenAI, or Gemini.
 """
 
-import asyncio
 import json
 import logging
 from datetime import datetime
 
 from src.config import Settings, get_settings
-from src.indicators.local_indicators import compute_all, last_n, latest
 
 
 class TradingAgent:
@@ -290,11 +288,9 @@ class TradingAgent:
             "- You can use leverage, but the system enforces a hard cap. Stay within the limits.\n"
             "- In high volatility (elevated ATR) or during funding spikes, reduce or avoid leverage.\n"
             "- Treat allocation_usd as notional exposure; keep it consistent with safe leverage and available margin.\n\n"
-            "Tool usage\n"
-            "- Use the fetch_indicator tool whenever an additional datapoint could sharpen your thesis; parameters: indicator (ema/sma/rsi/macd/bbands/atr/adx/obv/vwap/stoch_rsi/all), asset (e.g. \"BTC\", \"OIL\", \"GOLD\"), interval (\"5m\"/\"4h\"), optional period.\n"
-            "- Indicators are computed locally from Hyperliquid candle data - works for ALL perp markets (crypto, commodities, indices).\n"
-            "- Incorporate tool findings into your reasoning, but NEVER paste raw tool responses into the final JSON - summarize the insight instead.\n"
-            "- Use tools to upgrade your analysis; lack of confidence is a cue to query them before deciding.\n\n"
+            "Indicator usage\n"
+            "- Use the pre-fetched 5m and 4h indicators in the supplied context; do not assume any missing datapoint.\n"
+            "- Indicators are computed locally from closed Hyperliquid candle data for all configured perp markets.\n\n"
             "Reasoning recipe (first principles)\n"
             "- Structure (trend, EMAs slope/cross, HH/HL vs LH/LL), Momentum (MACD regime, RSI slope), Liquidity/volatility (ATR, volume), Positioning tilt (funding, OI).\n"
             "- Favor alignment across 4h and 5m. Counter-trend scalps require stronger intraday confirmation and tighter risk.\n\n"
@@ -307,53 +303,6 @@ class TradingAgent:
             "  - limit_price: required if order_type is \"limit\", null otherwise\n"
             "- Do not emit Markdown or any extra properties.\n"
         )
-
-        tools = [
-            {
-                "name": "fetch_indicator",
-                "description": (
-                    "Fetch technical indicators computed locally from Hyperliquid candle data. "
-                    "Works for ALL Hyperliquid perp markets including crypto (BTC, ETH, SOL), "
-                    "commodities (OIL, GOLD, SILVER), indices (SPX), and more. "
-                    "Available indicators: ema, sma, rsi, macd, bbands, atr, adx, obv, vwap, stoch_rsi, all. "
-                    "Returns the latest values and recent series."
-                ),
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "indicator": {
-                            "type": "string",
-                            "enum": [
-                                "ema",
-                                "sma",
-                                "rsi",
-                                "macd",
-                                "bbands",
-                                "atr",
-                                "adx",
-                                "obv",
-                                "vwap",
-                                "stoch_rsi",
-                                "all",
-                            ],
-                        },
-                        "asset": {
-                            "type": "string",
-                            "description": "Hyperliquid asset symbol, e.g. BTC, ETH, OIL, GOLD, SPX",
-                        },
-                        "interval": {
-                            "type": "string",
-                            "enum": ["1m", "5m", "15m", "1h", "4h", "1d"],
-                        },
-                        "period": {
-                            "type": "integer",
-                            "description": "Indicator period (default varies by indicator)",
-                        },
-                    },
-                    "required": ["indicator", "asset", "interval"],
-                },
-            }
-        ]
 
         messages = [{"role": "user", "content": context}]
 
@@ -377,7 +326,9 @@ class TradingAgent:
                 "messages": msgs,
             }
             if use_tools and self.enable_tool_calling:
-                kwargs["tools"] = tools
+                logging.info(
+                    "Indicator tool-calling is disabled; using pre-fetched market context"
+                )
             if self.settings.ai.thinking_enabled:
                 kwargs["thinking"] = {
                     "type": "enabled",
@@ -400,106 +351,13 @@ class TradingAgent:
             return response
 
         def _handle_tool_call(tool_name, tool_input):
-            if tool_name != "fetch_indicator":
-                return json.dumps({"error": f"Unknown tool: {tool_name}"})
-
-            if self.hyperliquid is None:
-                return json.dumps({"error": "Tool call unavailable: hyperliquid client is not set"})
-
-            try:
-                asset = tool_input["asset"]
-                interval = tool_input["interval"]
-                indicator = tool_input["indicator"]
-
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    import concurrent.futures
-
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                        candles = pool.submit(
-                            asyncio.run,
-                            self.hyperliquid.get_candles(asset, interval, 100),
-                        ).result(timeout=30)
-                else:
-                    candles = asyncio.run(self.hyperliquid.get_candles(asset, interval, 100))
-
-                all_indicators = compute_all(candles)
-
-                if indicator == "all":
-                    result = {
-                        k: {
-                            "latest": latest(v) if isinstance(v, list) else v,
-                            "series": last_n(v, 10) if isinstance(v, list) else v,
-                        }
-                        for k, v in all_indicators.items()
-                    }
-                elif indicator == "macd":
-                    result = {
-                        "macd": {
-                            "latest": latest(all_indicators.get("macd", [])),
-                            "series": last_n(all_indicators.get("macd", []), 10),
-                        },
-                        "signal": {
-                            "latest": latest(all_indicators.get("macd_signal", [])),
-                            "series": last_n(all_indicators.get("macd_signal", []), 10),
-                        },
-                        "histogram": {
-                            "latest": latest(all_indicators.get("macd_histogram", [])),
-                            "series": last_n(all_indicators.get("macd_histogram", []), 10),
-                        },
-                    }
-                elif indicator == "bbands":
-                    result = {
-                        "upper": {
-                            "latest": latest(all_indicators.get("bbands_upper", [])),
-                            "series": last_n(all_indicators.get("bbands_upper", []), 10),
-                        },
-                        "middle": {
-                            "latest": latest(all_indicators.get("bbands_middle", [])),
-                            "series": last_n(all_indicators.get("bbands_middle", []), 10),
-                        },
-                        "lower": {
-                            "latest": latest(all_indicators.get("bbands_lower", [])),
-                            "series": last_n(all_indicators.get("bbands_lower", []), 10),
-                        },
-                    }
-                elif indicator in ("ema", "sma"):
-                    period = tool_input.get("period", 20)
-                    from src.indicators.local_indicators import ema as _ema, sma as _sma
-
-                    closes = [c["close"] for c in candles]
-                    series = _ema(closes, period) if indicator == "ema" else _sma(closes, period)
-                    result = {"latest": latest(series), "series": last_n(series, 10), "period": period}
-                elif indicator == "rsi":
-                    period = tool_input.get("period", 14)
-                    from src.indicators.local_indicators import rsi as _rsi
-
-                    series = _rsi(candles, period)
-                    result = {"latest": latest(series), "series": last_n(series, 10), "period": period}
-                elif indicator == "atr":
-                    period = tool_input.get("period", 14)
-                    from src.indicators.local_indicators import atr as _atr
-
-                    series = _atr(candles, period)
-                    result = {"latest": latest(series), "series": last_n(series, 10), "period": period}
-                else:
-                    key_map = {
-                        "adx": "adx",
-                        "obv": "obv",
-                        "vwap": "vwap",
-                        "stoch_rsi": "stoch_rsi",
-                    }
-                    mapped = key_map.get(indicator, indicator)
-                    series = all_indicators.get(mapped, [])
-                    result = {
-                        "latest": latest(series) if isinstance(series, list) else series,
-                        "series": last_n(series, 10) if isinstance(series, list) else series,
-                    }
-
-                return json.dumps(result, default=str)
-            except Exception as ex:
-                logging.error("Tool call error: %s", ex)
-                return json.dumps({"error": str(ex)})
+            del tool_input
+            return json.dumps({
+                "error": (
+                    f"Tool '{tool_name}' is disabled. Use the pre-fetched market_data "
+                    "indicators already supplied in the prompt context."
+                )
+            })
 
         if self.provider == "anthropic":
             for _ in range(6):
@@ -551,11 +409,11 @@ class TradingAgent:
                     break
                 return self._parse_response_text(raw_text, assets)
 
-            return self._fallback_hold(assets, "tool loop cap")
+            return self._fallback_hold(assets, "provider response loop cap")
 
         if self.enable_tool_calling:
             logging.info(
-                "ENABLE_TOOL_CALLING is only supported for AI_PROVIDER=anthropic in this version. "
+                "ENABLE_TOOL_CALLING is ignored; all providers use pre-fetched indicator context. "
                 "Continuing without tool-calling for provider=%s",
                 self.provider,
             )

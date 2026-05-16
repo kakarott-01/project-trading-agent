@@ -136,8 +136,8 @@ Rules:
 
 ## Provider Notes
 
-- Anthropic mode supports tool-calling (`fetch_indicator`) and optional thinking budget.
-- OpenAI and Gemini currently run direct prompt-response path (tool-calling is Anthropic-only in this version).
+- Anthropic mode uses the same pre-fetched indicator context as other providers and supports optional thinking budget.
+- OpenAI, Anthropic, and Gemini run direct prompt-response paths without indicator tool-calling.
 - Output sanitization uses `AI_SANITIZE_MODEL` (or provider-specific default if unset).
 
 ## API Endpoints
@@ -145,6 +145,7 @@ Rules:
 When running, local API exposes:
 
 - `GET /diary` -> trade diary JSON or raw output
+- `GET /alarms` -> critical trading alarms, including unprotected-position failures
 - `GET /logs` -> log file tail/raw output
 
 ## Project Structure

@@ -705,6 +705,8 @@ class HyperliquidAPI:
                     "isBuy": order.get("isBuy"),
                     "sz": size,
                     "px": px,
+                    "current_price": px,
+                    "mark_price": px,
                     "notional": notional,
                 }
             )

@@ -242,6 +242,66 @@ class ExecutionService:
             amount = self._round_order_amount(asset, alloc_usd / current_price)
             rounded_alloc = amount * current_price
 
+        try:
+            latest_price = await self.broker.get_current_price(asset)
+        except Exception as exc:
+            logging.error("Failed to refresh price immediately before %s order: %s", asset, exc)
+            self._append_diary(
+                {
+                    "timestamp": cycle_start.isoformat(),
+                    "asset": asset,
+                    "action": "risk_blocked",
+                    "source": adjusted_intent.source,
+                    "reason": f"Price refresh before order failed: {exc}",
+                }
+            )
+            return
+
+        if latest_price <= 0:
+            logging.error("Blocked %s: refreshed price is invalid (%s)", asset, latest_price)
+            return
+
+        current_price = latest_price
+        amount = self._round_order_amount(asset, alloc_usd / current_price)
+        rounded_alloc = amount * current_price
+        if amount <= 0 or rounded_alloc <= 0:
+            logging.error("Rounded order amount became non-positive for %s after price refresh", asset)
+            return
+
+        submission_trade = adjusted_intent.to_dict()
+        submission_trade["allocation_usd"] = rounded_alloc
+        submission_trade["current_price"] = current_price
+        allowed_for_submission, reason_for_submission, submission_adjusted = self.risk_manager.validate_trade(
+            submission_trade,
+            fresh_state,
+            0,
+        )
+        if not allowed_for_submission:
+            logging.warning(
+                "RISK BLOCKED %s after pre-submit price refresh: %s",
+                asset,
+                reason_for_submission,
+            )
+            self._append_diary(
+                {
+                    "timestamp": cycle_start.isoformat(),
+                    "asset": asset,
+                    "action": "risk_blocked",
+                    "source": adjusted_intent.source,
+                    "reason": f"Pre-submit price recheck failed: {reason_for_submission}",
+                }
+            )
+            return
+
+        adjusted_intent = TradeIntent.from_dict(submission_adjusted)
+        alloc_usd = adjusted_intent.allocation_usd
+        leverage = float(adjusted_intent.leverage or 1.0)
+        amount = self._round_order_amount(asset, alloc_usd / current_price)
+        rounded_alloc = amount * current_price
+        if amount <= 0 or rounded_alloc <= 0:
+            logging.error("Rounded order amount became non-positive for %s after submission recheck", asset)
+            return
+
         is_buy = adjusted_intent.action == "buy"
 
         lev_result = await self.broker.set_leverage(asset, leverage, is_cross=True)

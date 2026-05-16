@@ -105,7 +105,10 @@ class CycleRunner:
             except Exception as exc:
                 logging.error("State refresh after reconcile failed: %s", exc)
 
-            drawdown_ok, drawdown_reason = self.risk_manager.check_daily_drawdown(account_value)
+            drawdown_ok, drawdown_reason = self.risk_manager.check_daily_drawdown(
+                account_value,
+                float(state.get("balance", 0) or 0),
+            )
             if not drawdown_ok:
                 logging.warning("Risk breaker state: %s", drawdown_reason)
 
@@ -222,6 +225,7 @@ class CycleRunner:
     ) -> int:
         to_cancel = self.risk_manager.get_entry_orders_to_cancel(state)
         cancelled = 0
+        breaker_active = self.risk_manager.circuit_breaker_active
         for order in to_cancel:
             asset = str(order.get("coin") or order.get("asset") or "")
             oid = order.get("oid")
@@ -235,6 +239,23 @@ class CycleRunner:
                     oid,
                     asset,
                 )
+                self._append_diary(
+                    {
+                        "timestamp": cycle_start.isoformat(),
+                        "asset": asset,
+                        "action": (
+                            "circuit_breaker_cancel_pending_entry"
+                            if breaker_active
+                            else "risk_cancel_pending_entry"
+                        ),
+                        "oid": oid,
+                        "reason": (
+                            "Daily loss circuit breaker active"
+                            if breaker_active
+                            else "Pending entry exceeds risk limits"
+                        ),
+                    }
+                )
             except Exception as exc:
                 logging.error(
                     "Failed to cancel pending entry order oid=%s for %s: %s",
@@ -243,6 +264,13 @@ class CycleRunner:
                     exc,
                 )
         return cancelled
+
+    def _append_diary(self, entry: dict) -> None:
+        try:
+            with open(self.diary_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry) + "\n")
+        except Exception:
+            logging.exception("Failed to append cycle diary entry")
 
     def _persist_cycle_log(
         self,

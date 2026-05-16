@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -21,10 +22,12 @@ class ReconciliationService:
         broker: MarketDataPort | ExecutionPort,
         risk_manager: RiskManager,
         diary_path: str = "diary.jsonl",
+        alarm_path: str = "alarms.jsonl",
     ):
         self.broker = broker
         self.risk_manager = risk_manager
         self.diary_path = diary_path
+        self.alarm_path = alarm_path
 
     async def bootstrap_active_trades(
         self,
@@ -425,21 +428,42 @@ class ReconciliationService:
         cycle_start: datetime,
         reason: str,
     ) -> None:
-        close_cloid = self.broker.generate_client_order_id()
-        try:
-            await self.broker.cancel_all_orders(trade.asset)
-            result = await self.broker.close_position_market(
-                trade.asset,
-                amount=size,
-                cloid_raw=close_cloid,
-            )
-            summary = self.broker.summarize_order_result(result)
-            close_ok = bool(summary.get("is_success"))
-        except Exception as exc:
-            close_ok = False
-            logging.error("Failed fail-closed flatten for %s: %s", trade.asset, exc)
+        close_ok = False
+        close_cloid = None
+        last_error = None
+        for attempt in range(1, 4):
+            close_cloid = self.broker.generate_client_order_id()
+            try:
+                await self.broker.cancel_all_orders(trade.asset)
+                result = await self.broker.close_position_market(
+                    trade.asset,
+                    amount=size,
+                    cloid_raw=close_cloid,
+                )
+                summary = self.broker.summarize_order_result(result)
+                close_ok = bool(summary.get("is_success"))
+                if close_ok:
+                    break
+                last_error = "; ".join(summary.get("error_messages") or []) or str(summary)
+                logging.critical(
+                    "Fail-closed flatten attempt %d/3 rejected for %s: %s",
+                    attempt,
+                    trade.asset,
+                    last_error,
+                )
+            except Exception as exc:
+                close_ok = False
+                last_error = str(exc)
+                logging.critical(
+                    "Fail-closed flatten attempt %d/3 failed for %s: %s",
+                    attempt,
+                    trade.asset,
+                    exc,
+                )
+            if attempt < 3:
+                await asyncio.sleep(1)
 
-        trade.status = "failed_no_stop"
+        trade.status = "fail_closed_flattened" if close_ok else "failed_no_stop"
         trade.tp_oid = None
         trade.sl_oid = None
         trade.last_synced_at = cycle_start.isoformat()
@@ -455,6 +479,19 @@ class ReconciliationService:
                 "client_order_id": close_cloid,
             }
         )
+        if not close_ok:
+            alarm = {
+                "timestamp": cycle_start.isoformat(),
+                "severity": "CRITICAL",
+                "asset": trade.asset,
+                "action": "failed_no_stop",
+                "reason": reason,
+                "requested_size": size,
+                "last_error": last_error,
+                "status": "POSITION_MAY_BE_OPEN_WITHOUT_STOP",
+            }
+            logging.critical("FAILED_NO_STOP alarm: %s", alarm)
+            self._append_alarm(alarm)
 
     def _build_record(
         self,
@@ -642,4 +679,8 @@ class ReconciliationService:
 
     def _append_diary(self, entry: dict) -> None:
         with open(self.diary_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+
+    def _append_alarm(self, entry: dict) -> None:
+        with open(self.alarm_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry) + "\n")
