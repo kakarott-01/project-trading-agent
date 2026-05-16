@@ -208,6 +208,7 @@ class DecisionContext:
     risk_limits: dict[str, Any]
     invocation: InvocationMetadata
     capital_budget_usd: float
+    capital_pct: float
     provider_label: str
 
     def to_prompt_payload(self) -> dict[str, Any]:
@@ -220,6 +221,7 @@ class DecisionContext:
                 "source": self.provider_label,
                 "enabled": True,
                 "capital_budget_usd": round(self.capital_budget_usd, 2),
+                "capital_pct": round(self.capital_pct, 4),
             },
             "instructions": {
                 "assets": self.assets,

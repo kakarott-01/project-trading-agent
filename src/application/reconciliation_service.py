@@ -356,6 +356,9 @@ class ReconciliationService:
                     trade.tp_price = tp_price
                 if sl_price is not None:
                     trade.sl_price = sl_price
+                # Mutate the shared order snapshot in place so later trades in
+                # this same reconciliation pass see orders created/cancelled by
+                # SL repair without waiting for the next cycle.
                 open_orders[:] = refreshed_orders
 
             if not trade.tp_oid and trade.tp_price:

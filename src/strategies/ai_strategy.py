@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import OrderedDict
 import asyncio
 
 from src.agent.decision_maker import LLMDecisionEngine
@@ -26,10 +25,6 @@ class AIStrategy(Strategy):
         self.prompt_builder = prompt_builder
 
     async def generate(self, context: DecisionContext) -> StrategyResult:
-        context_payload = OrderedDict(context.to_prompt_payload())
-        context_payload["execution_mode"]["capital_pct"] = (
-            self.settings.execution.ai_capital_pct
-        )
         prompt = self.prompt_builder.build_ai_prompt(context)
 
         def _is_failed_outputs(outs) -> bool:
@@ -41,7 +36,7 @@ class AIStrategy(Strategy):
             return any(
                 isinstance(decision, dict)
                 and decision.get("action") == "hold"
-                and "parse error" in (decision.get("rationale", "").lower())
+                and decision.get("rationale") == "Parse error"
                 for decision in decisions
             )
 
@@ -59,12 +54,10 @@ class AIStrategy(Strategy):
 
         if _is_failed_outputs(outputs):
             logging.warning("Retrying AI once due to invalid/parse-error output")
-            retry_payload = OrderedDict(
-                [
-                    ("retry_instruction", "Return ONLY the JSON object per schema, no prose."),
-                    ("original_context", context_payload),
-                ]
-            )
+            retry_payload = {
+                "retry_instruction": "Return ONLY the JSON object per schema, no prose.",
+                "original_context": context.to_prompt_payload(),
+            }
             try:
                 loop = asyncio.get_running_loop()
                 outputs = await loop.run_in_executor(

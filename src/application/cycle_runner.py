@@ -59,6 +59,8 @@ class CycleRunner:
         self.start_time = datetime.now(timezone.utc)
         self.invocation_count = 0
         self.trade_log: list[dict] = []
+        # Shared by the sequential cycle runner and services it calls. Do not
+        # access this list from parallel coroutines without adding synchronization.
         self.active_trades = [
             ActiveTradeRecord.from_dict(trade) for trade in load_active_trades()
         ]
@@ -179,6 +181,7 @@ class CycleRunner:
                                 risk_limits=self.risk_manager.get_risk_summary(),
                                 invocation=invocation,
                                 capital_budget_usd=capital_budget_usd,
+                                capital_pct=capital_pct,
                                 provider_label=strategy.source,
                             ),
                         )

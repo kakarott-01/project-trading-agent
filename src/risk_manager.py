@@ -182,6 +182,10 @@ class RiskManager:
         Hyperliquid leverage is enforced at the position level by the exchange.
         This fail-closed check treats the strategy allocation as margin at risk
         and caps allocation * requested leverage against account equity.
+
+        With normal bounded configs this is intentionally a belt-and-suspenders
+        guard after the stricter position-size cap. It becomes relevant only if
+        future configs allow unusually large per-position allocations.
         """
         if account_value <= 0:
             return False, "Account value is zero or negative"
@@ -688,7 +692,9 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
-        # 6. Implicit leverage (notional vs equity)
+        # 6. Implicit leverage (notional vs equity). Under current RISK_BOUNDS
+        # this is usually redundant with position-size caps, but keep it as a
+        # final invariant if future configs loosen those caps.
         ok, reason = self.check_leverage(alloc_usd, account_value, trade["leverage"])
         if not ok:
             return False, reason, trade

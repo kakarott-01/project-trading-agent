@@ -33,6 +33,8 @@ class ExecutionService:
         self.reconciliation_service = reconciliation_service
         self.diary_path = diary_path
         self.alarm_path = alarm_path
+        # Short-lived duplicate-submit guard. It is intentionally in memory;
+        # persisted pending active-trade statuses cover restart gaps for 300s.
         self._pending_submission_guard: dict[str, datetime] = {}
 
     async def execute(

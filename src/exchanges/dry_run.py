@@ -36,6 +36,7 @@ class DryRunBroker:
         self.state_path = state_path
         self.diary_path = diary_path
         self.state = self._load_state()
+        self._save_state()
 
     async def preload_assets(self, assets: list[str]) -> None:
         await self.delegate.preload_assets(assets)
@@ -117,6 +118,7 @@ class DryRunBroker:
         await self._refresh_trigger_orders()
         positions = []
         unrealized = 0.0
+        margin_used = 0.0
         for asset, position in list(self.state["positions"].items()):
             current_px = await self.get_current_price(asset)
             size_signed = float(position.get("szi") or 0.0)
@@ -125,6 +127,8 @@ class DryRunBroker:
             entry_px = float(position.get("entryPx") or current_px or 0.0)
             pnl = self._pnl(size_signed, entry_px, current_px)
             unrealized += pnl
+            margin = self._position_margin(position)
+            margin_used += margin
             normalized = {
                 "coin": asset,
                 "szi": size_signed,
@@ -135,6 +139,7 @@ class DryRunBroker:
                 "notional_current": abs(size_signed) * current_px,
                 "position_value": abs(size_signed) * current_px,
                 "leverage": {"type": "cross", "value": position.get("leverage", 1.0)},
+                "margin_used": margin,
                 "dry_run": True,
             }
             positions.append(normalized)
@@ -142,7 +147,7 @@ class DryRunBroker:
         cash = float(self.state["cash"])
         return {
             "balance": cash,
-            "total_value": cash + unrealized,
+            "total_value": cash + margin_used + unrealized,
             "positions": positions,
             "pending_entry_orders": [],
             "pending_entry_assets": [],
@@ -285,13 +290,26 @@ class DryRunBroker:
                 reason="dry_run_flip_flatten",
             )
 
+        leverage = max(float(self.state["leverage"].get(asset, 1.0) or 1.0), 1.0)
+        margin_required = amount * price / leverage
+        if margin_required > float(self.state["cash"]):
+            return {
+                "status": "error",
+                "error": (
+                    f"Insufficient dry-run cash for margin: requires ${margin_required:.2f}, "
+                    f"available ${float(self.state['cash']):.2f}"
+                ),
+            }
+
         oid = self._next_oid()
         signed_size = amount if is_buy else -amount
+        self.state["cash"] = float(self.state["cash"]) - margin_required
         self.state["positions"][asset] = {
             "coin": asset,
             "szi": signed_size,
             "entryPx": price,
-            "leverage": self.state["leverage"].get(asset, 1.0),
+            "leverage": leverage,
+            "margin": margin_required,
             "opened_at": datetime.now(timezone.utc).isoformat(),
         }
         self._record_fill(
@@ -402,7 +420,9 @@ class DryRunBroker:
         if close_size <= 0:
             return 0.0
         realized_pnl = self._pnl(size_signed, entry_px, price, size=close_size)
-        self.state["cash"] = float(self.state["cash"]) + realized_pnl
+        margin = self._position_margin(position)
+        margin_released = margin * (close_size / abs(size_signed))
+        self.state["cash"] = float(self.state["cash"]) + margin_released + realized_pnl
         remaining_size = abs(size_signed) - close_size
         if remaining_size <= 1e-12:
             self.state["positions"].pop(asset, None)
@@ -411,6 +431,7 @@ class DryRunBroker:
             ]
         else:
             self.state["positions"][asset]["szi"] = remaining_size if size_signed > 0 else -remaining_size
+            self.state["positions"][asset]["margin"] = margin - margin_released
         self._record_fill(
             asset=asset,
             oid=oid,
@@ -419,6 +440,7 @@ class DryRunBroker:
             size=close_size,
             price=price,
             realized_pnl=realized_pnl,
+            margin_released=margin_released,
             reason=reason,
         )
         return close_size
@@ -434,6 +456,7 @@ class DryRunBroker:
         price: float,
         realized_pnl: float,
         reason: str,
+        margin_released: float = 0.0,
     ) -> None:
         fill = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -444,6 +467,7 @@ class DryRunBroker:
             "sz": size,
             "px": price,
             "realized_pnl": realized_pnl,
+            "margin_released": margin_released,
             "reason": reason,
             "dry_run": True,
         }
@@ -459,6 +483,7 @@ class DryRunBroker:
                 "amount": size,
                 "price": price,
                 "realized_pnl": round(realized_pnl, 8),
+                "margin_released": round(margin_released, 8),
                 "client_order_id": cloid,
                 "dry_run": True,
             },
@@ -477,6 +502,7 @@ class DryRunBroker:
                     state.setdefault("leverage", {})
                     state.setdefault("fills", [])
                     state.setdefault("next_oid", 1)
+                    self._migrate_position_margins(state)
                     return state
             except (OSError, json.JSONDecodeError) as exc:
                 logging.error("Failed to load dry-run state; starting fresh: %s", exc)
@@ -488,6 +514,30 @@ class DryRunBroker:
             "fills": [],
             "next_oid": 1,
         }
+
+    @staticmethod
+    def _migrate_position_margins(state: dict[str, Any]) -> None:
+        migrated_margin = 0.0
+        for position in state.get("positions", {}).values():
+            if "margin" in position:
+                continue
+            leverage = max(float(position.get("leverage") or 1.0), 1.0)
+            size = abs(float(position.get("szi") or 0.0))
+            entry_px = float(position.get("entryPx") or 0.0)
+            margin = size * entry_px / leverage
+            position["margin"] = margin
+            migrated_margin += margin
+        if migrated_margin > 0:
+            state["cash"] = float(state.get("cash", 0.0)) - migrated_margin
+
+    @staticmethod
+    def _position_margin(position: dict[str, Any]) -> float:
+        if position.get("margin") is not None:
+            return max(float(position.get("margin") or 0.0), 0.0)
+        leverage = max(float(position.get("leverage") or 1.0), 1.0)
+        size = abs(float(position.get("szi") or 0.0))
+        entry_px = float(position.get("entryPx") or 0.0)
+        return size * entry_px / leverage
 
     def _save_state(self) -> None:
         path = data_path(self.state_path)

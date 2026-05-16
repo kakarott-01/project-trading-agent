@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 
 from aiohttp import web
 
 from src.config import Settings
+from src.utils.log_files import JSONL_BACKUPS
 from src.utils.security import (
     MAX_DIARY_RESPONSE_BYTES,
     MAX_LOG_RESPONSE_BYTES,
@@ -87,11 +89,9 @@ class ApiServer:
     async def handle_alarms(self, request: web.Request) -> web.Response:
         try:
             raw = request.query.get("raw")
-            if not os.path.exists(self.alarm_path):
+            data = self._read_alarm_history()
+            if not data:
                 return web.json_response({"entries": []})
-
-            with open(self.alarm_path, "r", encoding="utf-8") as handle:
-                data = handle.read(MAX_DIARY_RESPONSE_BYTES + 1)
 
             if len(data) > MAX_DIARY_RESPONSE_BYTES:
                 data = data[-MAX_DIARY_RESPONSE_BYTES:]
@@ -110,6 +110,19 @@ class ApiServer:
             return web.json_response({"entries": entries, "has_critical": bool(entries)})
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
+
+    def _read_alarm_history(self) -> str:
+        chunks: list[str] = []
+        for idx in range(JSONL_BACKUPS, 0, -1):
+            rotated = f"{self.alarm_path}.{idx}.gz"
+            if not os.path.exists(rotated):
+                continue
+            with gzip.open(rotated, "rt", encoding="utf-8", errors="replace") as handle:
+                chunks.append(handle.read())
+        if os.path.exists(self.alarm_path):
+            with open(self.alarm_path, "r", encoding="utf-8", errors="replace") as handle:
+                chunks.append(handle.read())
+        return "".join(chunks)
 
     async def handle_logs(self, request: web.Request) -> web.Response:
         requested = request.query.get("path", "llm_requests.log")
