@@ -17,6 +17,8 @@ from src.utils.state_persistence import save_active_trades
 class ReconciliationService:
     """Keeps local state aligned with exchange truth."""
 
+    PENDING_CONFIRMATION_TIMEOUT_SECONDS = 300
+
     def __init__(
         self,
         broker: MarketDataPort | ExecutionPort,
@@ -223,6 +225,17 @@ class ReconciliationService:
         if existing is None or not existing.client_order_id:
             return None
 
+        if (
+            existing.status == "pending_confirmation"
+            and self._record_age_seconds(existing) > self.PENDING_CONFIRMATION_TIMEOUT_SECONDS
+        ):
+            logging.error(
+                "Dropping stale pending confirmation for %s after %ss",
+                existing.asset,
+                self.PENDING_CONFIRMATION_TIMEOUT_SECONDS,
+            )
+            return None
+
         status = await self.broker.query_order_status(cloid_raw=existing.client_order_id)
         if not status:
             if existing.status == "pending_confirmation":
@@ -235,6 +248,18 @@ class ReconciliationService:
         if status["is_canceled"] or status["is_rejected"]:
             return None
         return "pending_confirmation"
+
+    @staticmethod
+    def _record_age_seconds(existing: ActiveTradeRecord) -> float:
+        if not existing.opened_at:
+            return 0.0
+        try:
+            opened_at = datetime.fromisoformat(existing.opened_at.replace("Z", "+00:00"))
+            if opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - opened_at).total_seconds()
+        except ValueError:
+            return 0.0
 
     async def _ensure_protection_orders(
         self,

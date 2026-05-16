@@ -9,6 +9,8 @@ import os
 import threading
 from typing import Any
 
+from src.utils.paths import data_path
+
 TEXT_LOG_MAX_BYTES = 50 * 1024 * 1024
 TEXT_LOG_BACKUPS = 3
 JSONL_MAX_BYTES = 50 * 1024 * 1024
@@ -65,13 +67,14 @@ def rotate_if_needed(
     compress: bool = False,
 ) -> None:
     """Rotate ``path`` when it is over ``max_bytes`` before the next append."""
+    resolved = str(data_path(path))
     try:
-        if not os.path.exists(path) or os.path.getsize(path) < max_bytes:
+        if not os.path.exists(resolved) or os.path.getsize(resolved) < max_bytes:
             return
         if compress:
-            _rotate_jsonl_file(path, backup_count)
+            _rotate_jsonl_file(resolved, backup_count)
         else:
-            _rotate_text_file(path, backup_count)
+            _rotate_text_file(resolved, backup_count)
     except OSError as exc:
         logging.warning("Failed to rotate %s: %s", path, exc)
 
@@ -87,9 +90,10 @@ def append_text_log(
     """Append text to a rotated log file."""
     with _LOG_FILE_LOCK:
         rotate_if_needed(path, max_bytes=max_bytes, backup_count=backup_count)
+        resolved = str(data_path(path))
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         mode = 0o600 if private else 0o644
-        fd = os.open(path, flags, mode)
+        fd = os.open(resolved, flags, mode)
         try:
             if private:
                 os.fchmod(fd, 0o600)
@@ -116,5 +120,5 @@ def append_jsonl(
             backup_count=backup_count,
             compress=True,
         )
-        with open(path, "a", encoding="utf-8") as handle:
+        with open(data_path(path), "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, default=str) + "\n")

@@ -190,13 +190,20 @@ The signer executes trades on behalf of the vault wallet and should not hold tre
 ## Docker Note
 
 The `Dockerfile` installs all supported AI provider SDKs and copies `algo.py`.
-Mount your runtime `.env` when running the container:
+Use Compose for production so the bot restarts after crashes or host reboots and writes mutable state to `./data`:
 
 ```bash
-docker run --env-file .env -p 3000:3000 hyperliquid-trading-agent
+docker compose up -d trading-bot
 ```
 
-If you prefer a bind mount for live config edits, use `-v "$PWD/.env:/app/.env:ro"`.
+Enable 5-minute state archives, with optional rclone object-storage upload:
+
+```bash
+cp rclone.conf.example rclone.conf  # then fill in your remote
+BACKUP_REMOTE=s3:my-bucket/hyperliquid-trading-agent docker compose --profile backup up -d
+```
+
+For one-off `docker run`, include `--restart=always`, `--env-file .env`, `-v "$PWD/data:/app/data"`, and `-v "$PWD/algo.py:/app/algo.py:ro"`.
 
 ## License / Disclaimer
 

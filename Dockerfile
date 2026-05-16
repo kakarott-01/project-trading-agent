@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12.8-slim
 
 WORKDIR /app
 
@@ -22,6 +22,7 @@ COPY algo.py ./algo.py
 # API defaults — bind to loopback inside container; expose via port mapping
 ENV API_HOST=0.0.0.0
 ENV API_PORT=3000
+ENV TRADING_DATA_DIR=/app/data
 EXPOSE 3000
 
 # Healthcheck: verify the API responds, including API_SECRET when configured.

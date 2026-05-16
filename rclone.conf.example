@@ -1,0 +1,10 @@
+# Copy to rclone.conf and fill in a real remote before enabling the backup profile.
+# See: https://rclone.org/s3/ or your object-storage provider's rclone docs.
+#
+# [s3]
+# type = s3
+# provider = Other
+# access_key_id = YOUR_ACCESS_KEY
+# secret_access_key = YOUR_SECRET_KEY
+# endpoint = https://s3.example.com
+# acl = private

@@ -7,6 +7,8 @@ import logging
 import os
 from aiohttp import web
 
+from src.utils.paths import data_dir
+
 # Files the /logs endpoint is allowed to serve. Period.
 ALLOWED_LOG_FILES = {
     "llm_requests.log",
@@ -61,10 +63,10 @@ def safe_log_path(requested: str) -> str | None:
     if filename not in ALLOWED_LOG_FILES:
         return None
     # Resolve to absolute path anchored at CWD
-    resolved = os.path.realpath(os.path.join(os.getcwd(), filename))
-    cwd = os.path.realpath(os.getcwd())
-    # Confirm it's still inside CWD (defense in depth against symlink attacks)
-    if not resolved.startswith(cwd + os.sep) and resolved != cwd:
+    base = os.path.realpath(data_dir())
+    resolved = os.path.realpath(os.path.join(base, filename))
+    # Confirm it's still inside the data dir (defense in depth against symlink attacks)
+    if not resolved.startswith(base + os.sep) and resolved != base:
         return None
     return resolved
 

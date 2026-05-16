@@ -205,3 +205,22 @@ alias use_gemini='cat .env.common .env.gemini > .env && echo Active profile: gem
 ```bash
 git config core.hooksPath .githooks
 ```
+
+## 12) Production deployment
+
+Use Docker Compose so the bot has a restart policy and persistent state:
+
+```bash
+mkdir -p data backups
+docker compose up -d trading-bot
+```
+
+`TRADING_DATA_DIR=./data` keeps `active_trades.json`, `risk_state.json`, `diary.jsonl`, alarms, and logs on a host-mounted volume.
+
+For object-storage backups, copy `rclone.conf.example` to `rclone.conf`, configure the remote, set `BACKUP_REMOTE` in `.env`, then start the backup profile:
+
+```bash
+docker compose --profile backup up -d
+```
+
+The backup sidecar archives state every 5 minutes and uploads it to `BACKUP_REMOTE` when configured.

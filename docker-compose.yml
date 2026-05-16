@@ -1,0 +1,50 @@
+services:
+  trading-bot:
+    build: .
+    restart: always
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TRADING_DATA_DIR: /app/data
+    volumes:
+      - ./algo.py:/app/algo.py:ro
+      - ./data:/app/data
+    ports:
+      - "${API_PORT:-3000}:3000"
+
+  state-backup:
+    image: rclone/rclone:1.66
+    restart: always
+    profiles:
+      - backup
+    environment:
+      BACKUP_REMOTE: "${BACKUP_REMOTE:-}"
+    volumes:
+      - ./data:/data:ro
+      - ./backups:/backups
+      - type: bind
+        source: ./rclone.conf
+        target: /config/rclone/rclone.conf
+        read_only: true
+        bind:
+          create_host_path: false
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -eu
+        while true; do
+          stamp=$$(date -u +%Y%m%dT%H%M%SZ)
+          archive="/backups/trading-state-$${stamp}.tar.gz"
+          files=""
+          for f in active_trades.json risk_state.json diary.jsonl alarms.jsonl; do
+            if [ -f "/data/$${f}" ]; then files="$${files} $${f}"; fi
+          done
+          if [ -n "$${files}" ]; then tar -czf "$${archive}" -C /data $${files}; fi
+          if [ -n "$${BACKUP_REMOTE}" ] && [ -f "$${archive}" ]; then
+            rclone copy "$${archive}" "$${BACKUP_REMOTE}"
+          fi
+          find /backups -name 'trading-state-*.tar.gz' -mtime +7 -delete
+          sleep 300
+        done

@@ -50,6 +50,7 @@ class RiskManager:
         self.daily_high_value: float | None = None
         self.daily_high_date = None
         self.circuit_breaker_date = None
+        self.asset_cooldowns: dict[str, str] = {}
         self._load_persisted_state()
 
     def _load_persisted_state(self) -> None:
@@ -71,6 +72,14 @@ class RiskManager:
                     "It remains active for today (%s).",
                     today,
                 )
+            raw_cooldowns = state.get("asset_cooldowns") or {}
+            if isinstance(raw_cooldowns, dict):
+                self.asset_cooldowns = {
+                    str(asset): str(until)
+                    for asset, until in raw_cooldowns.items()
+                    if until
+                }
+                self._prune_asset_cooldowns()
 
     def _persist_state(self) -> None:
         save_risk_state({
@@ -78,6 +87,7 @@ class RiskManager:
             "circuit_breaker_active": self.circuit_breaker_active,
             "daily_high_value": self.daily_high_value,
             "daily_high_basis": "cash_balance",
+            "asset_cooldowns": self.asset_cooldowns,
         })
 
     def _reset_daily_if_needed(self, reference_value: float) -> None:
@@ -109,6 +119,39 @@ class RiskManager:
             )
         return True, ""
 
+    def check_asset_cooldown(self, asset: str) -> tuple[bool, str]:
+        """Block assets that recently hit a loss-based safety cooldown."""
+        self._prune_asset_cooldowns()
+        until_raw = self.asset_cooldowns.get(asset)
+        if not until_raw:
+            return True, ""
+        return False, f"{asset} is in loss cooldown until {until_raw}"
+
+    def _prune_asset_cooldowns(self) -> None:
+        now = datetime.now(timezone.utc)
+        changed = False
+        for asset, until_raw in list(self.asset_cooldowns.items()):
+            try:
+                until = datetime.fromisoformat(until_raw.replace("Z", "+00:00"))
+                if until.tzinfo is None:
+                    until = until.replace(tzinfo=timezone.utc)
+            except ValueError:
+                until = now
+            if until <= now:
+                self.asset_cooldowns.pop(asset, None)
+                changed = True
+        if changed:
+            self._persist_state()
+
+    def _set_asset_loss_cooldown(self, asset: str) -> None:
+        if not asset:
+            return
+        now = datetime.now(timezone.utc)
+        tomorrow = (now.date().toordinal() + 1)
+        cooldown_until = datetime.fromordinal(tomorrow).replace(tzinfo=timezone.utc)
+        self.asset_cooldowns[asset] = cooldown_until.isoformat()
+        self._persist_state()
+
     def check_total_exposure(
         self,
         positions: list[dict],
@@ -128,21 +171,27 @@ class RiskManager:
             )
         return True, ""
 
-    def check_leverage(self, alloc_usd: float, account_value: float) -> tuple[bool, str]:
-        """Check that the notional exposure relative to account equity is within limits.
+    def check_leverage(
+        self,
+        alloc_usd: float,
+        account_value: float,
+        leverage: float,
+    ) -> tuple[bool, str]:
+        """Check effective notional exposure relative to account equity.
 
         Hyperliquid leverage is enforced at the position level by the exchange.
-        This check prevents the bot from sizing a position so large that the
-        implicit leverage (notional / account_value) exceeds our configured max.
+        This fail-closed check treats the strategy allocation as margin at risk
+        and caps allocation * requested leverage against account equity.
         """
         if account_value <= 0:
             return False, "Account value is zero or negative"
-        # alloc_usd here is NOTIONAL exposure, account_value is total equity
-        implicit_leverage = alloc_usd / account_value
-        if implicit_leverage > self.max_leverage:
+        effective_notional = alloc_usd * max(float(leverage or 1.0), 1.0)
+        effective_leverage = effective_notional / account_value
+        if effective_leverage > self.max_leverage:
             return False, (
-                f"Implicit leverage {implicit_leverage:.1f}x "
-                f"(notional ${alloc_usd:.2f} / equity ${account_value:.2f}) "
+                f"Effective leverage {effective_leverage:.1f}x "
+                f"(allocation ${alloc_usd:.2f} * leverage {leverage:.2f}x "
+                f"/ equity ${account_value:.2f}) "
                 f"exceeds max {self.max_leverage}x"
             )
         return True, ""
@@ -492,6 +541,7 @@ class RiskManager:
                     "RISK: Force-closing %s — margin loss %.2f%% exceeds max %.2f%%",
                     coin, loss_pct, self.max_loss_per_position_pct,
                 )
+                self._set_asset_loss_cooldown(str(coin))
                 to_close.append({
                     "coin": coin,
                     "size": abs(size),
@@ -586,6 +636,10 @@ class RiskManager:
         is_buy = action == "buy"
         asset = str(trade.get("asset") or "")
 
+        ok, reason = self.check_asset_cooldown(asset)
+        if not ok:
+            return False, reason, trade
+
         # 1. Daily drawdown circuit breaker
         ok, reason = self.check_daily_drawdown(account_value, balance)
         if not ok:
@@ -637,7 +691,7 @@ class RiskManager:
             return False, reason, trade
 
         # 6. Implicit leverage (notional vs equity)
-        ok, reason = self.check_leverage(alloc_usd, account_value)
+        ok, reason = self.check_leverage(alloc_usd, account_value, trade["leverage"])
         if not ok:
             return False, reason, trade
 

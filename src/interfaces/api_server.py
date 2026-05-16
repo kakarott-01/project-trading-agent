@@ -14,6 +14,7 @@ from src.utils.security import (
     make_auth_middleware,
     safe_log_path,
 )
+from src.utils.paths import data_path
 
 
 class ApiServer:
@@ -26,8 +27,8 @@ class ApiServer:
         alarm_path: str = "alarms.jsonl",
     ):
         self.settings = settings
-        self.diary_path = diary_path
-        self.alarm_path = alarm_path
+        self.diary_path = str(data_path(diary_path))
+        self.alarm_path = str(data_path(alarm_path))
         self.runner: web.AppRunner | None = None
 
     async def start(self) -> web.AppRunner:

@@ -11,6 +11,7 @@ from typing import Any
 from src.domain.models import AccountDashboard, ActiveTradeRecord, MarketSnapshot
 from src.exchanges.base import MarketDataPort
 from src.indicators.local_indicators import compute_all, last_n, latest
+from src.utils.paths import data_path
 from src.utils.prompt_utils import round_or_none, round_series
 
 
@@ -33,8 +34,9 @@ class MarketDataService:
 
     def __init__(self, broker: MarketDataPort, diary_path: str = "diary.jsonl"):
         self.broker = broker
-        self.diary_path = diary_path
+        self.diary_path = str(data_path(diary_path))
         self.price_history: dict[str, deque] = {}
+        self.candle_cache: dict[tuple[str, str, int], tuple[int, list[dict[str, Any]]]] = {}
 
     async def fetch_account_state(
         self,
@@ -157,13 +159,13 @@ class MarketDataService:
                 oi = await self.broker.get_open_interest(asset)
                 funding = await self.broker.get_funding_rate(asset)
                 candles_5m = self._drop_in_progress_candle(
-                    await self.broker.get_candles(asset, "5m", 100),
+                    await self._get_candles_cached(asset, "5m", 100, cycle_start),
                     "5m",
                     cycle_start,
                     asset,
                 )
                 candles_4h = self._drop_in_progress_candle(
-                    await self.broker.get_candles(asset, "4h", 100),
+                    await self._get_candles_cached(asset, "4h", 100, cycle_start),
                     "4h",
                     cycle_start,
                     asset,
@@ -210,6 +212,25 @@ class MarketDataService:
                 logging.error("Data gather error %s: %s", asset, exc)
 
         return snapshots, asset_prices
+
+    async def _get_candles_cached(
+        self,
+        asset: str,
+        interval: str,
+        count: int,
+        current_time: datetime,
+    ) -> list[dict[str, Any]]:
+        interval_ms = self.INTERVAL_MS.get(interval, 300_000)
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        bucket = int(current_time.timestamp() * 1000) // interval_ms
+        key = (asset, interval, count)
+        cached = self.candle_cache.get(key)
+        if cached and cached[0] == bucket:
+            return cached[1]
+        candles = await self.broker.get_candles(asset, interval, count)
+        self.candle_cache[key] = (bucket, candles)
+        return candles
 
     def _drop_in_progress_candle(
         self,

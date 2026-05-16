@@ -4,22 +4,51 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import logging.handlers
 import os
 import signal
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
+
 from src.app.bootstrap import ApplicationRuntime
 from src.config import get_settings
+from src.utils.paths import data_path
+
+load_dotenv(override=True)
+
+
+class _JsonFormatter(logging.Formatter):
+    """Minimal JSON formatter for machine-readable file logs."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
 
 
 _rot_handler = logging.handlers.RotatingFileHandler(
-    "trading.log", maxBytes=10 * 1024 * 1024, backupCount=5
+    data_path("trading.log"), maxBytes=10 * 1024 * 1024, backupCount=5
+)
+_rot_handler.setFormatter(_JsonFormatter())
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 )
 logging.basicConfig(
-    handlers=[_rot_handler, logging.StreamHandler()],
+    handlers=[_rot_handler, _stream_handler],
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 

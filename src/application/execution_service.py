@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from src.application.reconciliation_service import ReconciliationService
@@ -17,6 +17,8 @@ from src.utils.state_persistence import save_active_trades
 
 class ExecutionService:
     """Executes normalized trade intents after risk validation."""
+
+    PENDING_LOCAL_MAX_SECONDS = 300
 
     def __init__(
         self,
@@ -31,6 +33,7 @@ class ExecutionService:
         self.reconciliation_service = reconciliation_service
         self.diary_path = diary_path
         self.alarm_path = alarm_path
+        self._pending_submission_guard: dict[str, datetime] = {}
 
     async def execute(
         self,
@@ -92,6 +95,42 @@ class ExecutionService:
         if intent.allocation_usd <= 0:
             logging.info("Skipping %s: zero allocation", asset)
             return
+
+        guarded_until = self._pending_submission_guard.get(asset)
+        now = datetime.now(timezone.utc)
+        if guarded_until and guarded_until > now:
+            logging.warning(
+                "Skipping %s: local submission guard active until %s",
+                asset,
+                guarded_until.isoformat(),
+            )
+            self._append_diary(
+                {
+                    "timestamp": cycle_start.isoformat(),
+                    "asset": asset,
+                    "action": "skip_pending_submission_guard",
+                    "source": intent.source,
+                    "guarded_until": guarded_until.isoformat(),
+                }
+            )
+            return
+        if guarded_until:
+            self._pending_submission_guard.pop(asset, None)
+
+        existing_local = self._get_active_trade(active_trades, asset)
+        if existing_local and existing_local.status in {
+            "submitting",
+            "pending_confirmation",
+            "pending_entry",
+        }:
+            age_seconds = self._record_age_seconds(existing_local, cycle_start)
+            if age_seconds < self.PENDING_LOCAL_MAX_SECONDS:
+                logging.warning(
+                    "Skipping %s: local active trade is still pending confirmation (age %.1fs)",
+                    asset,
+                    age_seconds,
+                )
+                return
 
         try:
             open_orders = await self.broker.get_open_orders()
@@ -359,6 +398,7 @@ class ExecutionService:
         save_active_trades([trade.to_dict() for trade in active_trades])
 
         try:
+            self._pending_submission_guard[asset] = datetime.now(timezone.utc) + timedelta(seconds=30)
             if is_buy:
                 order_result = await self.broker.place_buy_order(
                     asset,
@@ -431,6 +471,9 @@ class ExecutionService:
                 }
             )
             return
+
+        if synced_trade.status == "open_position":
+            self._pending_submission_guard.pop(asset, None)
 
         if synced_trade.status == "open_position" and not synced_trade.sl_oid:
             logging.error(
@@ -739,3 +782,17 @@ class ExecutionService:
             if not expect_open and position is None:
                 return last_state
         return last_state
+
+    @staticmethod
+    def _record_age_seconds(trade: ActiveTradeRecord, now: datetime) -> float:
+        if not trade.opened_at:
+            return 0.0
+        try:
+            opened_at = datetime.fromisoformat(trade.opened_at.replace("Z", "+00:00"))
+            if opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+            return max(0.0, (now - opened_at).total_seconds())
+        except ValueError:
+            return 0.0

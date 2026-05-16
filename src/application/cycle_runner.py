@@ -68,13 +68,7 @@ class CycleRunner:
         interval_secs = get_interval_seconds(self.interval)
 
         logging.info("Loaded %d active trades from disk", len(self.active_trades))
-        try:
-            await self.reconciliation_service.bootstrap_active_trades(
-                self.active_trades,
-                tracked_assets=self.assets,
-            )
-        except Exception as exc:
-            logging.error("Startup reconciliation failed: %s", exc)
+        await self._bootstrap_reconciliation_until_ready()
 
         while not self.shutdown_event.is_set():
             cycle_start = datetime.now(timezone.utc)
@@ -232,6 +226,33 @@ class CycleRunner:
 
         logging.info("Bot loop exited cleanly after %d cycles", self.invocation_count)
         save_active_trades([trade.to_dict() for trade in self.active_trades])
+
+    async def _bootstrap_reconciliation_until_ready(self) -> None:
+        """Fail closed on startup until exchange state has been reconciled."""
+        while not self.shutdown_event.is_set():
+            try:
+                await self.reconciliation_service.bootstrap_active_trades(
+                    self.active_trades,
+                    tracked_assets=self.assets,
+                )
+                logging.info("Startup reconciliation succeeded")
+                return
+            except Exception as exc:
+                logging.critical(
+                    "Startup reconciliation failed; trading is paused and will retry in 30s: %s",
+                    exc,
+                )
+                self._append_diary(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "action": "startup_reconciliation_retry",
+                        "reason": str(exc),
+                    }
+                )
+                try:
+                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
 
     async def _cancel_pending_entries_outside_limits(
         self,

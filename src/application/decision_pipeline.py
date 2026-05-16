@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import logging
 from collections import OrderedDict
+from datetime import datetime, timezone
 
 from src.domain.models import DecisionContext, StrategyResult, TradeIntent
 from src.strategies.base import Strategy
-from src.utils.log_files import append_text_log
+from src.utils.log_files import append_jsonl, append_text_log
 from src.utils.prompt_utils import json_default
 
 
@@ -24,6 +25,9 @@ class DecisionPipeline:
 
     def __init__(self, prompt_log_path: str = "prompts.log"):
         self.prompt_log_path = prompt_log_path
+        self.last_successful_decision_at: datetime | None = None
+        self.cycles_without_actionable_decision = 0
+        self.last_strategy_errors: list[str] = []
 
     @staticmethod
     def scale_decision_allocations(
@@ -136,13 +140,15 @@ class DecisionPipeline:
 
     def build_ai_prompt(self, context: DecisionContext) -> str:
         payload = OrderedDict(context.to_prompt_payload())
+        logged_payload = self._redact_prompt_payload(payload)
         try:
             append_text_log(
                 self.prompt_log_path,
                 (
                     f"\n\n--- {context.invocation.current_time.isoformat()} ---\n"
-                    f"{json.dumps(payload, indent=2, default=json_default)}\n"
+                    f"{json.dumps(logged_payload, indent=2, default=json_default)}\n"
                 ),
+                private=True,
             )
         except Exception:
             pass
@@ -153,18 +159,86 @@ class DecisionPipeline:
         )
         return json.dumps(payload, default=json_default)
 
+    @staticmethod
+    def _redact_prompt_payload(payload: OrderedDict) -> OrderedDict:
+        """Remove account financial details from the prompt log copy."""
+        redacted = OrderedDict(payload)
+        account = redacted.get("account")
+        if isinstance(account, dict):
+            redacted["account"] = {
+                "redacted": True,
+                "positions_count": len(account.get("positions") or []),
+                "active_trades": [
+                    {
+                        "asset": trade.get("asset"),
+                        "status": trade.get("status"),
+                        "source": trade.get("source"),
+                    }
+                    for trade in account.get("active_trades") or []
+                    if isinstance(trade, dict)
+                ],
+                "open_orders_count": len(account.get("open_orders") or []),
+                "recent_diary_count": len(account.get("recent_diary") or []),
+                "recent_fills_count": len(account.get("recent_fills") or []),
+            }
+        return redacted
+
     async def run_strategies(
         self,
         strategy_contexts: list[tuple[Strategy, DecisionContext]],
     ) -> tuple[list[TradeIntent], list[str]]:
         all_source_decisions: list[TradeIntent] = []
         reasoning_chunks: list[str] = []
+        strategy_errors: list[str] = []
         for strategy, context in strategy_contexts:
-            result: StrategyResult = await strategy.generate(context)
+            try:
+                result: StrategyResult = await strategy.generate(context)
+            except Exception as exc:
+                message = f"{strategy.source}: {exc}"
+                strategy_errors.append(message)
+                logging.error("Strategy failed (%s): %s", strategy.source, exc)
+                continue
             if result.reasoning:
                 reasoning_chunks.append(f"{result.source}: {result.reasoning[:1000]}")
             scaled = self.scale_decision_allocations(result.intents, context.capital_budget_usd)
             for intent in scaled:
                 intent.source = result.source
             all_source_decisions.extend(scaled)
+
+        actionable = [
+            decision
+            for decision in all_source_decisions
+            if decision.action in {"buy", "sell"} and decision.allocation_usd > 0
+        ]
+        self.last_strategy_errors = strategy_errors
+        if actionable:
+            self.last_successful_decision_at = datetime.now(timezone.utc)
+            self.cycles_without_actionable_decision = 0
+        else:
+            self.cycles_without_actionable_decision += 1
+            if self.cycles_without_actionable_decision > 2:
+                logging.critical(
+                    "No actionable strategy decisions for %d consecutive cycles; "
+                    "last_successful_decision_at=%s errors=%s",
+                    self.cycles_without_actionable_decision,
+                    self.last_successful_decision_at.isoformat()
+                    if self.last_successful_decision_at
+                    else None,
+                    strategy_errors,
+                )
+                append_jsonl(
+                    "alarms.jsonl",
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "severity": "CRITICAL",
+                        "action": "no_actionable_strategy_decisions",
+                        "cycles_without_actionable_decision": self.cycles_without_actionable_decision,
+                        "last_successful_decision_at": (
+                            self.last_successful_decision_at.isoformat()
+                            if self.last_successful_decision_at
+                            else None
+                        ),
+                        "strategy_errors": strategy_errors,
+                    },
+                )
         return all_source_decisions, reasoning_chunks

@@ -6,10 +6,10 @@ Supports one active provider at a time: Anthropic, OpenAI, or Gemini.
 import hashlib
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.config import Settings, get_settings
-from src.utils.log_files import append_text_log
+from src.utils.log_files import append_jsonl, append_text_log
 
 
 class TradingAgent:
@@ -365,6 +365,15 @@ class TradingAgent:
 
         def _handle_tool_call(tool_name, tool_input):
             del tool_input
+            alarm = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "severity": "ERROR",
+                "action": "ai_tool_call_rejected",
+                "tool": tool_name,
+                "reason": "Tool calling is disabled; prompt already includes pre-fetched indicators.",
+            }
+            logging.error("AI attempted disabled tool call: %s", tool_name)
+            append_jsonl("alarms.jsonl", alarm)
             return json.dumps({
                 "error": (
                     f"Tool '{tool_name}' is disabled. Use the pre-fetched market_data "
