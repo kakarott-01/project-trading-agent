@@ -65,6 +65,7 @@ class CycleRunner:
 
     async def run(self) -> None:
         await self.market_data_service.broker.preload_assets(self.assets)
+        await self.market_data_service.broker.validate_assets(self.assets)
         interval_secs = get_interval_seconds(self.interval)
 
         logging.info("Loaded %d active trades from disk", len(self.active_trades))
@@ -303,6 +304,8 @@ class CycleRunner:
 
     def _append_diary(self, entry: dict) -> None:
         try:
+            if getattr(self.market_data_service.broker, "dry_run", False):
+                entry = {**entry, "dry_run": True}
             append_jsonl(self.diary_path, entry)
         except Exception:
             logging.exception("Failed to append cycle diary entry")

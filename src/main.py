@@ -51,6 +51,19 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
+RISK_ENV_VARS = {
+    "MAX_POSITION_PCT",
+    "MAX_LOSS_PER_POSITION_PCT",
+    "MAX_LEVERAGE",
+    "MAX_TOTAL_EXPOSURE_PCT",
+    "MAX_CORRELATED_BASKET_EXPOSURE_PCT",
+    "DAILY_LOSS_CIRCUIT_BREAKER_PCT",
+    "MANDATORY_SL_PCT",
+    "MAX_CONCURRENT_POSITIONS",
+    "MIN_BALANCE_RESERVE_PCT",
+    "MIN_TRADE_CONFIDENCE",
+}
+
 
 def clear_terminal() -> None:
     os.system("cls" if os.name == "nt" else "clear")
@@ -85,6 +98,15 @@ async def main_async() -> None:
     runtime = ApplicationRuntime(settings=settings, assets=assets, interval=interval)
 
     print(f"Starting trading agent: assets={assets}  interval={interval}")
+    if settings.runtime.dry_run:
+        print(
+            "DRY RUN ENABLED: using real market data and AI decisions, "
+            "but simulating all fills locally."
+        )
+        logging.warning(
+            "DRY RUN ENABLED: no live orders will be submitted; virtual balance starts at $%.2f",
+            settings.runtime.dry_run_initial_balance,
+        )
     print(
         f"Modes: AI={settings.execution.enable_ai_trading} "
         f"({settings.execution.ai_capital_pct}%)  "
@@ -93,6 +115,21 @@ async def main_async() -> None:
     )
     if settings.execution.enable_ai_trading:
         print(f"Provider/model: {settings.ai.provider}/{settings.ai.model}")
+
+    configured_risk_vars = sorted(name for name in RISK_ENV_VARS if name in os.environ)
+    if settings.risk.safe_retail_mode and configured_risk_vars:
+        logging.warning(
+            "SAFE_RETAIL_MODE=%s with preset=%s overrides configured risk env vars (%s). "
+            "Effective caps: max_leverage=%.2fx, max_position_pct=%.2f%%, "
+            "max_total_exposure_pct=%.2f%%, daily_loss_circuit_breaker_pct=%.2f%%.",
+            settings.risk.safe_retail_mode,
+            settings.risk.safe_retail_preset,
+            ", ".join(configured_risk_vars),
+            settings.risk.max_leverage,
+            settings.risk.max_position_pct,
+            settings.risk.max_total_exposure_pct,
+            settings.risk.daily_loss_circuit_breaker_pct,
+        )
 
     await runtime.api_server.start()
     logging.info("API listening on %s:%d", settings.api.host, settings.api.port)

@@ -23,3 +23,37 @@ class HyperliquidBroker(HyperliquidAPI):
                 continue
             await self.get_meta_and_ctxs(dex=dex)
             loaded_dexes.add(dex)
+
+    async def validate_assets(self, assets: list[str]) -> None:
+        """Fail fast when configured symbols are not listed in Hyperliquid metadata."""
+
+        await self.preload_assets(assets)
+        available = self._available_asset_names()
+        invalid = [asset for asset in assets if asset not in available]
+        if invalid:
+            examples = ", ".join(sorted(list(available))[:20])
+            raise RuntimeError(
+                "Invalid ASSETS configuration; not found on Hyperliquid: "
+                f"{', '.join(invalid)}. Example available symbols: {examples}"
+            )
+
+    def _available_asset_names(self) -> set[str]:
+        available: set[str] = set()
+        if self._meta_cache and isinstance(self._meta_cache, list):
+            meta = self._meta_cache[0]
+            for item in meta.get("universe", []):
+                name = item.get("name")
+                if name:
+                    available.add(str(name))
+
+        for dex, payload in self._hip3_meta_cache.items():
+            if not isinstance(payload, list) or not payload:
+                continue
+            meta = payload[0]
+            for item in meta.get("universe", []):
+                name = item.get("name")
+                if not name:
+                    continue
+                available.add(str(name))
+                available.add(f"{dex}:{name}")
+        return available

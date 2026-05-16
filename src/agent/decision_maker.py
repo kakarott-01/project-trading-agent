@@ -8,12 +8,13 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from src.agent.prompts import build_decision_system_prompt
 from src.config import Settings, get_settings
 from src.utils.log_files import append_jsonl, append_text_log
 
 
-class TradingAgent:
-    """High-level trading agent that delegates reasoning to the configured AI model."""
+class LLMDecisionEngine:
+    """AI provider orchestrator that delegates reasoning to the configured model."""
 
     SUPPORTED_PROVIDERS = {"anthropic", "openai", "gemini"}
 
@@ -253,59 +254,7 @@ class TradingAgent:
 
     def _decide(self, context, assets):
         """Dispatch decision request to configured provider and enforce output contract."""
-        system_prompt = (
-            "You are a rigorous QUANTITATIVE TRADER and interdisciplinary MATHEMATICIAN-ENGINEER optimizing risk-adjusted returns for perpetual futures under real execution, margin, and funding constraints.\n"
-            "You will receive market + account context for SEVERAL assets, including:\n"
-            f"- assets = {json.dumps(list(assets))}\n"
-            "- per-asset intraday (5m) and higher-timeframe (4h) metrics\n"
-            "- Active Trades with Exit Plans\n"
-            "- Recent Trading History\n"
-            "- Risk management limits (hard-enforced by the system, not just guidelines)\n\n"
-            "Always use the 'current time' provided in the user message to evaluate any time-based conditions, such as cooldown expirations or timed exit plans.\n\n"
-            "Your goal: make decisive, first-principles decisions per asset that minimize churn while capturing edge.\n\n"
-            "Aggressively pursue setups where calculated risk is outweighed by expected edge; size positions so downside is controlled while upside remains meaningful.\n\n"
-            "Core policy (low-churn, position-aware)\n"
-            "1) Respect prior plans: If an active trade has an exit_plan with explicit invalidation (e.g., \"close if 4h close above EMA50\"), DO NOT close or flip early unless that invalidation (or a stronger one) has occurred.\n"
-            "2) Hysteresis: Require stronger evidence to CHANGE a decision than to keep it. Only flip direction if BOTH:\n"
-            "   a) Higher-timeframe structure supports the new direction (e.g., 4h EMA20 vs EMA50 and/or MACD regime), AND\n"
-            "   b) Intraday structure confirms with a decisive break beyond ~0.5×ATR (recent) and momentum alignment (MACD or RSI slope).\n"
-            "   Otherwise, prefer HOLD or adjust TP/SL.\n"
-            "3) Cooldown: After opening, adding, reducing, or flipping, impose a self-cooldown of at least 3 bars of the decision timeframe (e.g., 3×5m = 15m) before another direction change, unless a hard invalidation occurs. Encode this in exit_plan (e.g., \"cooldown_bars:3 until 2025-10-19T15:55Z\"). You must honor your own cooldowns on future cycles.\n"
-            "4) Funding is a tilt, not a trigger: Do NOT open/close/flip solely due to funding unless expected funding over your intended holding horizon meaningfully exceeds expected edge (e.g., > ~0.25×ATR). Consider that funding accrues discretely and slowly relative to 5m bars.\n"
-            "5) Overbought/oversold != reversal by itself: Treat RSI extremes as risk-of-pullback. You need structure + momentum confirmation to bet against trend. Prefer tightening stops or taking partial profits over instant flips.\n"
-            "6) Prefer adjustments over exits: If the thesis weakens but is not invalidated, first consider: tighten stop (e.g., to a recent swing or ATR multiple), trail TP, or reduce size. Flip only on hard invalidation + fresh confluence.\n\n"
-            "Decision discipline (per asset)\n"
-            "- Choose one: buy / sell / hold.\n"
-            "- Proactively harvest profits when price action presents a clear, high-quality opportunity that aligns with your thesis.\n"
-            "- You control allocation_usd (but the system will cap it - see risk limits below).\n"
-            "- All entry orders are submitted as market orders in this fail-closed execution mode.\n"
-            "  - Always set order_type to \"market\".\n"
-            "  - Always set limit_price to null.\n"
-            "  - Do not plan resting limit entries; they are rejected by risk controls.\n"
-            "- TP/SL sanity:\n"
-            "  - BUY: tp_price > current_price, sl_price < current_price\n"
-            "  - SELL: tp_price < current_price, sl_price > current_price\n"
-            "  If sensible TP/SL cannot be set, use null and explain the logic. A mandatory SL will be auto-applied if you do not set one.\n"
-            "- exit_plan must include at least ONE explicit invalidation trigger and may include cooldown guidance you will follow later.\n\n"
-            "Leverage policy (perpetual futures)\n"
-            "- You can use leverage, but the system enforces a hard cap. Stay within the limits.\n"
-            "- In high volatility (elevated ATR) or during funding spikes, reduce or avoid leverage.\n"
-            "- Treat allocation_usd as notional exposure; keep it consistent with safe leverage and available margin.\n\n"
-            "Indicator usage\n"
-            "- Use the pre-fetched 5m and 4h indicators in the supplied context; do not assume any missing datapoint.\n"
-            "- Indicators are computed locally from closed Hyperliquid candle data for all configured perp markets.\n\n"
-            "Reasoning recipe (first principles)\n"
-            "- Structure (trend, EMAs slope/cross, HH/HL vs LH/LL), Momentum (MACD regime, RSI slope), Liquidity/volatility (ATR, volume), Positioning tilt (funding, OI).\n"
-            "- Favor alignment across 4h and 5m. Counter-trend scalps require stronger intraday confirmation and tighter risk.\n\n"
-            "Output contract\n"
-            "- Output ONLY a strict JSON object (no markdown, no code fences) with exactly two properties:\n"
-            "  - \"reasoning\": long-form string capturing detailed, step-by-step analysis.\n"
-            "  - \"trade_decisions\": array ordered to match the provided assets list.\n"
-            "- Each item inside trade_decisions must contain the keys: asset, action, allocation_usd, order_type, limit_price, tp_price, sl_price, exit_plan, rationale.\n"
-            "  - order_type: \"market\" only\n"
-            "  - limit_price: null\n"
-            "- Do not emit Markdown or any extra properties.\n"
-        )
+        system_prompt = build_decision_system_prompt(list(assets))
 
         messages = [{"role": "user", "content": context}]
 
@@ -449,3 +398,7 @@ class TradingAgent:
             return self._fallback_hold(assets, f"Provider call failed: {ex}")
 
         return self._parse_response_text(raw_text, assets)
+
+
+# Backward-compatible alias for external imports.
+TradingAgent = LLMDecisionEngine

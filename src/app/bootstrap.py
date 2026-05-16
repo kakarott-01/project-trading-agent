@@ -11,6 +11,7 @@ from src.application.execution_service import ExecutionService
 from src.application.market_data_service import MarketDataService
 from src.application.reconciliation_service import ReconciliationService
 from src.config import Settings
+from src.exchanges.dry_run import DryRunBroker
 from src.exchanges.hyperliquid_adapter import HyperliquidBroker
 from src.interfaces.api_server import ApiServer
 from src.risk_manager import RiskManager
@@ -28,7 +29,12 @@ class ApplicationRuntime:
         self.interval = interval
         self.shutdown_event = asyncio.Event()
 
-        self.broker = HyperliquidBroker(settings)
+        live_broker = HyperliquidBroker(settings)
+        self.broker = (
+            DryRunBroker(live_broker, settings)
+            if settings.runtime.dry_run
+            else live_broker
+        )
         self.risk_manager = RiskManager(settings=settings)
         self.market_data_service = MarketDataService(self.broker)
         self.decision_pipeline = DecisionPipeline()

@@ -705,6 +705,8 @@ class ReconciliationService:
         return tp_orders, sl_orders
 
     def _append_diary(self, entry: dict) -> None:
+        if getattr(self.broker, "dry_run", False):
+            entry = {**entry, "dry_run": True}
         append_jsonl(self.diary_path, entry)
 
     def _append_alarm(self, entry: dict) -> None:

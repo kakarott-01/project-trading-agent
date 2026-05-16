@@ -214,7 +214,7 @@ class ExecutionService:
         trade_log: list[dict],
     ) -> None:
         intent.current_price = current_price
-        allowed, reason, adjusted = self.risk_manager.validate_trade(intent.to_dict(), fresh_state, 0)
+        allowed, reason, adjusted = self.risk_manager.validate_trade(intent.to_dict(), fresh_state)
         adjusted_intent = TradeIntent.from_dict(adjusted)
         if not allowed:
             logging.warning("RISK BLOCKED %s: %s", intent.asset, reason)
@@ -261,7 +261,6 @@ class ExecutionService:
             allowed_after_rounding, reason_after_rounding, rounded_adjusted = self.risk_manager.validate_trade(
                 rounded_trade,
                 fresh_state,
-                0,
             )
             if not allowed_after_rounding:
                 logging.warning(
@@ -317,7 +316,6 @@ class ExecutionService:
         allowed_for_submission, reason_for_submission, submission_adjusted = self.risk_manager.validate_trade(
             submission_trade,
             fresh_state,
-            0,
         )
         if not allowed_for_submission:
             logging.warning(
@@ -758,6 +756,8 @@ class ExecutionService:
         active_trades.append(trade)
 
     def _append_diary(self, entry: dict) -> None:
+        if getattr(self.broker, "dry_run", False):
+            entry = {**entry, "dry_run": True}
         append_jsonl(self.diary_path, entry)
 
     def _append_alarm(self, entry: dict) -> None:

@@ -169,6 +169,8 @@ class ExecutionModeSettings:
 class RuntimeSettings:
     assets: list[str]
     interval: str | None
+    dry_run: bool
+    dry_run_initial_balance: float
 
 
 @dataclass(frozen=True)
@@ -355,7 +357,13 @@ def _load_settings() -> Settings:
     runtime = RuntimeSettings(
         assets=assets,
         interval=_get_env("INTERVAL"),
+        dry_run=_get_bool("DRY_RUN", False),
+        dry_run_initial_balance=float(
+            _get_float("DRY_RUN_INITIAL_BALANCE", 10000.0) or 10000.0
+        ),
     )
+    if runtime.dry_run_initial_balance <= 0:
+        raise RuntimeError("DRY_RUN_INITIAL_BALANCE must be greater than 0")
 
     safe_retail_mode = _get_bool("SAFE_RETAIL_MODE", True)
     safe_retail_preset = (
@@ -453,7 +461,11 @@ def _load_settings() -> Settings:
         ),
     )
 
-    if not settings.hyperliquid.private_key and not settings.hyperliquid.mnemonic:
+    if (
+        not settings.runtime.dry_run
+        and not settings.hyperliquid.private_key
+        and not settings.hyperliquid.mnemonic
+    ):
         raise RuntimeError(
             "Either HYPERLIQUID_PRIVATE_KEY/LIGHTER_PRIVATE_KEY or MNEMONIC must be provided"
         )

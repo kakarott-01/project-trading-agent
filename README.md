@@ -14,6 +14,7 @@ The runtime also supports hybrid mode where AI and algo run together with a conf
 
 - Multi-provider AI decision engine with shared JSON output contract.
 - Optional deterministic custom strategy from `algo.py`.
+- Paper trading via `DRY_RUN=true`: real market data and AI decisions with local simulated fills.
 - Local indicator stack (no external TA API requirement for core flow).
 - Risk manager enforces hard checks before every execution.
 - Market support includes standard and HIP-3 symbols (`dex:asset`, for example `xyz:GOLD`).
@@ -108,6 +109,8 @@ Core runtime:
 
 - `ASSETS`
 - `INTERVAL`
+- `DRY_RUN` (`true` simulates execution and never submits live orders)
+- `DRY_RUN_INITIAL_BALANCE` (virtual USDC starting balance for paper trading)
 - `HYPERLIQUID_PRIVATE_KEY`
 - `HYPERLIQUID_VAULT_ADDRESS`
 
@@ -134,6 +137,12 @@ Rules:
 - enabled total must be `<= 100`
 - at least one mode must be enabled
 
+## Paper Trading
+
+Set `DRY_RUN=true` to test the bot without live orders. In this mode the runtime still fetches real Hyperliquid market data, runs the configured AI/algo strategy, and applies the same risk manager checks. The broker wrapper simulates market fills at the latest fetched price, tracks a virtual portfolio in `dry_run_state.json`, keeps paper-only bookkeeping in `dry_run_active_trades.json` and `dry_run_risk_state.json`, and appends diary entries with `"dry_run": true`.
+
+Dry-run trigger orders are also local: simulated stop-loss and take-profit orders close virtual positions when the latest price crosses the trigger.
+
 ## Provider Notes
 
 - Anthropic mode uses the same pre-fetched indicator context as other providers and supports optional thinking budget.
@@ -147,6 +156,17 @@ When running, local API exposes:
 - `GET /diary` -> trade diary JSON or raw output
 - `GET /alarms` -> critical trading alarms, including unprotected-position failures
 - `GET /logs` -> log file tail/raw output
+
+## Operational Scenarios
+
+- AI provider/API is down: the decision layer logs the provider error and returns hold decisions, so no new entries are submitted for that cycle.
+- Malformed AI output: the strategy retries once with a stricter JSON instruction, then falls back to holds if parsing still fails.
+- Invalid `ASSETS`: startup preloads Hyperliquid metadata and fails fast with the invalid symbols before trading begins.
+- Safe retail overrides: when `SAFE_RETAIL_MODE=true`, startup logs a warning listing any risk env vars being overridden and the effective caps.
+- Partial or uncertain fills: local active-trade state is marked pending and startup/cycle reconciliation polls exchange order and position state before acting again.
+- Bot crash mid-trade: `active_trades.json` and risk state are persisted under `TRADING_DATA_DIR`; on restart, startup reconciliation rebuilds local state from exchange truth before the trading loop resumes.
+- Daily circuit breaker fires: new decisions are skipped and pending entry orders are cancelled; protective/reconciliation logic continues to run.
+- Missing or invalid stop-loss after entry: reconciliation attempts to repair the SL; if repair fails, it submits a fail-closed market flatten and writes an alarm.
 
 ## Project Structure
 

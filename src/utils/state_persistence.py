@@ -12,8 +12,25 @@ from typing import Any
 from src.utils.paths import data_path
 
 ACTIVE_TRADES_FILE = "active_trades.json"
+DRY_RUN_ACTIVE_TRADES_FILE = "dry_run_active_trades.json"
 RISK_STATE_FILE = "risk_state.json"
+DRY_RUN_RISK_STATE_FILE = "dry_run_risk_state.json"
 _SAVE_LOCK = threading.Lock()
+
+
+def _env_bool(name: str) -> bool:
+    raw = os.getenv(name)
+    return bool(raw and raw.strip().lower() in {"1", "true", "yes", "on"})
+
+
+def _active_trades_path():
+    filename = DRY_RUN_ACTIVE_TRADES_FILE if _env_bool("DRY_RUN") else ACTIVE_TRADES_FILE
+    return data_path(filename)
+
+
+def _risk_state_path():
+    filename = DRY_RUN_RISK_STATE_FILE if _env_bool("DRY_RUN") else RISK_STATE_FILE
+    return data_path(filename)
 
 
 # ---------------------------------------------------------------------------
@@ -22,18 +39,18 @@ _SAVE_LOCK = threading.Lock()
 
 def load_active_trades() -> list[dict]:
     """Load active trades from disk. Returns empty list on missing/corrupt file."""
-    active_path = data_path(ACTIVE_TRADES_FILE)
+    active_path = _active_trades_path()
     if not active_path.exists():
         return []
     try:
         with open(active_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, list):
-            logging.warning("active_trades.json has unexpected structure; resetting")
+            logging.warning("%s has unexpected structure; resetting", active_path.name)
             return []
         return data
     except (json.JSONDecodeError, OSError) as exc:
-        logging.error("Failed to load active_trades.json: %s — resetting", exc)
+        logging.error("Failed to load %s: %s — resetting", active_path.name, exc)
         return []
 
 
@@ -43,7 +60,7 @@ def save_active_trades(trades: list[dict]) -> None:
     The existing file remains valid if the process dies before ``os.replace``;
     stale ``.tmp`` files are ignored by ``load_active_trades`` on restart.
     """
-    active_path = data_path(ACTIVE_TRADES_FILE)
+    active_path = _active_trades_path()
     tmp = active_path.with_name(
         f"{active_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
     )
@@ -68,7 +85,7 @@ def save_active_trades(trades: list[dict]) -> None:
 
 def load_risk_state() -> dict:
     """Load persisted risk state for today. Returns empty dict if stale or missing."""
-    risk_path = data_path(RISK_STATE_FILE)
+    risk_path = _risk_state_path()
     if not risk_path.exists():
         return {}
     try:
@@ -90,7 +107,7 @@ def load_risk_state() -> dict:
 
 def save_risk_state(state: dict[str, Any]) -> None:
     """Atomically write risk state to disk."""
-    risk_path = data_path(RISK_STATE_FILE)
+    risk_path = _risk_state_path()
     tmp = risk_path.with_name(f"{risk_path.name}.tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as f:

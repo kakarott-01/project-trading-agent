@@ -1,4 +1,4 @@
-"""AI strategy adapter around the existing TradingAgent implementation."""
+"""AI strategy adapter around the multi-provider LLM decision engine."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import logging
 from collections import OrderedDict
 import asyncio
 
-from src.agent.decision_maker import TradingAgent
+from src.agent.decision_maker import LLMDecisionEngine
 from src.config import Settings
 from src.domain.models import DecisionContext, StrategyResult, TradeIntent
 from src.exchanges.base import MarketDataPort
@@ -22,7 +22,7 @@ class AIStrategy(Strategy):
     def __init__(self, settings: Settings, broker: MarketDataPort, prompt_builder):
         self.settings = settings
         self.source = f"ai:{settings.ai.provider}"
-        self.agent = TradingAgent(hyperliquid=broker, settings=settings)
+        self.agent = LLMDecisionEngine(hyperliquid=broker, settings=settings)
         self.prompt_builder = prompt_builder
 
     async def generate(self, context: DecisionContext) -> StrategyResult:

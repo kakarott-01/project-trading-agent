@@ -63,6 +63,8 @@ HYPERLIQUID_NETWORK=mainnet
 # Runtime
 ASSETS="BTC ETH SOL OIL GOLD SILVER SPX"
 INTERVAL="5m"
+DRY_RUN=true
+DRY_RUN_INITIAL_BALANCE=10000
 
 # Execution modes
 ENABLE_AI_TRADING=true
@@ -215,7 +217,9 @@ mkdir -p data backups
 docker compose up -d trading-bot
 ```
 
-`TRADING_DATA_DIR=./data` keeps `active_trades.json`, `risk_state.json`, `diary.jsonl`, alarms, and logs on a host-mounted volume.
+`TRADING_DATA_DIR=./data` keeps `active_trades.json`, `risk_state.json`, `dry_run_active_trades.json`, `dry_run_risk_state.json`, `dry_run_state.json`, `diary.jsonl`, alarms, and logs on a host-mounted volume.
+
+Keep `DRY_RUN=true` for first deployments. It uses real market data and strategy decisions, simulates fills locally, and writes diary entries with `"dry_run": true`. Switch to `DRY_RUN=false` only after asset validation, logs, and risk caps look correct.
 
 For object-storage backups, copy `rclone.conf.example` to `rclone.conf`, configure the remote, set `BACKUP_REMOTE` in `.env`, then start the backup profile:
 

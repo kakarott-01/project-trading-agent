@@ -54,12 +54,13 @@ class HyperliquidAPI:
         self._meta_cache = None
         self._hip3_meta_cache = {}  # {dex_name: meta_response}
         self._candle_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self.wallet = None
         if self.settings.hyperliquid.private_key:
             self.wallet = Account.from_key(self.settings.hyperliquid.private_key)
         elif self.settings.hyperliquid.mnemonic:
             Account.enable_unaudited_hdwallet_features()
             self.wallet = Account.from_mnemonic(self.settings.hyperliquid.mnemonic)
-        else:
+        elif not self.settings.runtime.dry_run:
             raise ValueError("Either HYPERLIQUID_PRIVATE_KEY/LIGHTER_PRIVATE_KEY or MNEMONIC must be provided")
         # Choose base URL: allow override via env-config; fallback to network selection
         network = self.settings.hyperliquid.network
@@ -74,13 +75,20 @@ class HyperliquidAPI:
         # The agent wallet (private key) is just the authorized signer.
         self.account_address = self.settings.hyperliquid.vault_address
         # The address to query for state — main account if set, otherwise the signer
-        self.query_address = self.account_address or self.wallet.address
+        self.query_address = (
+            self.account_address
+            or (self.wallet.address if self.wallet is not None else None)
+        )
         self._build_clients()
 
     def _build_clients(self):
         """Instantiate exchange and info client instances for the active base URL."""
         self.info = Info(self.base_url)
-        self.exchange = Exchange(self.wallet, self.base_url, account_address=self.account_address)
+        self.exchange = (
+            Exchange(self.wallet, self.base_url, account_address=self.account_address)
+            if self.wallet is not None
+            else None
+        )
 
     def _reset_clients(self):
         """Recreate SDK clients after connection failures while logging failures."""

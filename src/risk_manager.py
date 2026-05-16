@@ -559,7 +559,6 @@ class RiskManager:
         self,
         trade: dict,
         account_state: dict,
-        _initial_balance_unused: float,  # kept for API compat, no longer used
     ) -> tuple[bool, str, dict]:
         """Run all safety checks on a proposed trade.
 
@@ -569,7 +568,6 @@ class RiskManager:
                 confidence, leverage, current_price
             account_state: Fresh account state with keys:
                 balance, total_value, positions
-            _initial_balance_unused: Deprecated parameter, ignored.
 
         Returns:
             (allowed, reason, adjusted_trade)
