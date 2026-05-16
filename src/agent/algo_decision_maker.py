@@ -122,13 +122,8 @@ class AlgoTradingAgent:
             if alloc < 0:
                 alloc = 0.0
 
-            order_type = str(source.get("order_type") or "market").lower()
-            if order_type not in {"market", "limit"}:
-                order_type = "market"
-
-            limit_price = _to_float(source.get("limit_price"))
-            if order_type == "market":
-                limit_price = None
+            order_type = "market"
+            limit_price = None
 
             confidence = _clamp_confidence(_to_float(source.get("confidence")))
 

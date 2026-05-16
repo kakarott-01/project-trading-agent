@@ -36,8 +36,11 @@ class MarketDataService:
         self.diary_path = diary_path
         self.price_history: dict[str, deque] = {}
 
-    async def fetch_account_state(self) -> tuple[dict, float]:
-        state = await self.broker.get_user_state()
+    async def fetch_account_state(
+        self,
+        open_orders: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict, float]:
+        state = await self.broker.get_user_state(open_orders=open_orders)
         account_value = float(
             state.get("total_value")
             or (state["balance"] + sum(position.get("pnl", 0) for position in state["positions"]))

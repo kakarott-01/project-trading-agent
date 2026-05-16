@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -11,6 +10,7 @@ from typing import Any
 from src.domain.models import ActiveTradeRecord
 from src.exchanges.base import ExecutionPort, MarketDataPort
 from src.risk_manager import RiskManager
+from src.utils.log_files import append_jsonl
 from src.utils.state_persistence import save_active_trades
 
 
@@ -91,8 +91,10 @@ class ReconciliationService:
         active_trades: list[ActiveTradeRecord],
         cycle_start: datetime,
         tracked_assets: list[str] | None = None,
+        open_orders: list[dict] | None = None,
     ) -> list[dict]:
-        open_orders = await self.broker.get_open_orders()
+        if open_orders is None:
+            open_orders = await self.broker.get_open_orders()
         changed = await self._rebuild_active_trades(
             state=state,
             open_orders=open_orders,
@@ -678,9 +680,7 @@ class ReconciliationService:
         return tp_orders, sl_orders
 
     def _append_diary(self, entry: dict) -> None:
-        with open(self.diary_path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry) + "\n")
+        append_jsonl(self.diary_path, entry)
 
     def _append_alarm(self, entry: dict) -> None:
-        with open(self.alarm_path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry) + "\n")
+        append_jsonl(self.alarm_path, entry)

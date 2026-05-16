@@ -6,6 +6,7 @@ from src.agent.algo_decision_maker import AlgoTradingAgent
 from src.config import Settings
 from src.domain.models import DecisionContext, StrategyResult, TradeIntent
 from src.strategies.base import Strategy
+from src.strategies.executors import ALGO_EXECUTOR
 
 
 class AlgoStrategy(Strategy):
@@ -19,7 +20,9 @@ class AlgoStrategy(Strategy):
     async def generate(self, context: DecisionContext) -> StrategyResult:
         import asyncio
 
-        outputs = await asyncio.to_thread(
+        loop = asyncio.get_running_loop()
+        outputs = await loop.run_in_executor(
+            ALGO_EXECUTOR,
             self.agent.decide_trade,
             context.assets,
             [snapshot.to_dict() for snapshot in context.market_snapshots],

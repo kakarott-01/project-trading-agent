@@ -50,8 +50,8 @@ Decision fields supported:
 - `asset` (required)
 - `action`: `buy` | `sell` | `hold`
 - `allocation_usd`
-- `order_type`: `market` | `limit`
-- `limit_price`
+- `order_type`: `market` only
+- `limit_price`: always `null`
 - `tp_price`
 - `sl_price`
 - `exit_plan`
@@ -62,8 +62,8 @@ Decision fields supported:
 Normalization behavior performed by runtime:
 
 - invalid/missing action -> `hold`
-- invalid order type -> `market`
-- market orders force `limit_price=null`
+- invalid or limit order type -> `market`
+- runtime forces `limit_price=null`
 - missing assets in your output become `hold`
 
 ## 5) Runtime Behavior After Algo Output

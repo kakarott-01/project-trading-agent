@@ -189,8 +189,14 @@ The signer executes trades on behalf of the vault wallet and should not hold tre
 
 ## Docker Note
 
-Current `Dockerfile` installs Anthropic dependencies by default.
-If you run OpenAI or Gemini inside Docker, add their SDK dependencies to the image first.
+The `Dockerfile` installs all supported AI provider SDKs and copies `algo.py`.
+Mount your runtime `.env` when running the container:
+
+```bash
+docker run --env-file .env -p 3000:3000 hyperliquid-trading-agent
+```
+
+If you prefer a bind mount for live config edits, use `-v "$PWD/.env:/app/.env:ro"`.
 
 ## License / Disclaimer
 

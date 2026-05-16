@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import os
+import hmac
 import logging
+import os
 from aiohttp import web
 
 # Files the /logs endpoint is allowed to serve. Period.
@@ -40,7 +41,7 @@ def make_auth_middleware(secret: str):
             or request.headers.get("Authorization", "").removeprefix("Bearer ")
             or request.query.get("key", "")
         )
-        if token != secret:
+        if not hmac.compare_digest(token.encode(), secret.encode()):
             return web.Response(status=401, text="Unauthorized")
         return await handler(request)
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from datetime import datetime
 from typing import Any
@@ -12,6 +11,7 @@ from src.application.reconciliation_service import ReconciliationService
 from src.domain.models import ActiveTradeRecord, TradeIntent
 from src.exchanges.base import ExecutionPort, MarketDataPort
 from src.risk_manager import RiskManager
+from src.utils.log_files import append_jsonl
 from src.utils.state_persistence import save_active_trades
 
 
@@ -24,11 +24,13 @@ class ExecutionService:
         risk_manager: RiskManager,
         reconciliation_service: ReconciliationService,
         diary_path: str = "diary.jsonl",
+        alarm_path: str = "alarms.jsonl",
     ):
         self.broker = broker
         self.risk_manager = risk_manager
         self.reconciliation_service = reconciliation_service
         self.diary_path = diary_path
+        self.alarm_path = alarm_path
 
     async def execute(
         self,
@@ -92,8 +94,8 @@ class ExecutionService:
             return
 
         try:
-            fresh_state = await self.broker.get_user_state()
             open_orders = await self.broker.get_open_orders()
+            fresh_state = await self.broker.get_user_state(open_orders=open_orders)
         except Exception as exc:
             logging.error("Failed to refresh state before trading %s: %s", asset, exc)
             return
@@ -120,6 +122,7 @@ class ExecutionService:
                     active_trades=active_trades,
                     cycle_start=cycle_start,
                     tracked_assets=[asset],
+                    open_orders=open_orders,
                 )
                 return
 
@@ -149,6 +152,7 @@ class ExecutionService:
                 active_trades=active_trades,
                 cycle_start=cycle_start,
                 tracked_assets=[asset],
+                open_orders=open_orders,
             )
             return
 
@@ -401,8 +405,12 @@ class ExecutionService:
         if not summary["is_success"] and not summary["statuses"]:
             logging.error("Entry order for %s was rejected: %s", asset, summary["error_messages"])
 
-        await asyncio.sleep(2)
-        post_state = await self.broker.get_user_state()
+        post_state = await self._poll_position_state(
+            asset=asset,
+            expect_open=True,
+            attempts=5,
+            delay_seconds=1.0,
+        )
         await self.reconciliation_service.reconcile_active_trades(
             state=post_state,
             active_trades=active_trades,
@@ -500,11 +508,42 @@ class ExecutionService:
             return
 
         close_cloid = self.broker.generate_client_order_id()
+        summary = {
+            "is_success": False,
+            "error_messages": [],
+        }
         try:
             await self.broker.cancel_all_orders(asset)
+            latest_state = await self.broker.get_user_state()
+            latest_position = self._find_position(latest_state, asset)
+            if latest_position is None:
+                await self.reconciliation_service.reconcile_active_trades(
+                    state=latest_state,
+                    active_trades=active_trades,
+                    cycle_start=cycle_start,
+                    tracked_assets=[asset],
+                )
+                logging.info("Skipping close for %s: position already flat after order cancellation", asset)
+                self._append_diary(
+                    {
+                        "timestamp": cycle_start.isoformat(),
+                        "asset": asset,
+                        "action": "close_position",
+                        "source": intent.source,
+                        "client_order_id": close_cloid,
+                        "requested_size": size,
+                        "closed": True,
+                        "rationale": "Position was already flat before close submission.",
+                    }
+                )
+                return
+
+            latest_size = abs(float(latest_position.get("szi") or 0.0))
+            if latest_size <= 0:
+                return
             result = await self.broker.close_position_market(
                 asset,
-                amount=size,
+                amount=latest_size,
                 cloid_raw=close_cloid,
             )
             summary = self.broker.summarize_order_result(result)
@@ -521,16 +560,34 @@ class ExecutionService:
             )
             return
 
-        await asyncio.sleep(2)
-        post_state = await self.broker.get_user_state()
+        post_state = await self._poll_position_state(
+            asset=asset,
+            expect_open=False,
+            attempts=5,
+            delay_seconds=1.0,
+        )
         await self.reconciliation_service.reconcile_active_trades(
             state=post_state,
             active_trades=active_trades,
             cycle_start=cycle_start,
             tracked_assets=[asset],
         )
-        still_open = self._get_active_trade(active_trades, asset)
-        fully_closed = still_open is None or still_open.status != "open_position"
+        live_position = self._find_position(post_state, asset)
+        fully_closed = live_position is None
+        if not fully_closed:
+            alarm = {
+                "timestamp": cycle_start.isoformat(),
+                "severity": "CRITICAL",
+                "asset": asset,
+                "action": "direction_flip_close_failed",
+                "source": intent.source,
+                "client_order_id": close_cloid,
+                "requested_size": size,
+                "remaining_size": abs(float(live_position.get("szi") or 0.0)),
+                "errors": summary["error_messages"],
+            }
+            logging.critical("Direction flip close failed for %s: %s", asset, alarm)
+            self._append_alarm(alarm)
 
         trade_log.append(
             {
@@ -658,5 +715,27 @@ class ExecutionService:
         active_trades.append(trade)
 
     def _append_diary(self, entry: dict) -> None:
-        with open(self.diary_path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry) + "\n")
+        append_jsonl(self.diary_path, entry)
+
+    def _append_alarm(self, entry: dict) -> None:
+        append_jsonl(self.alarm_path, entry)
+
+    async def _poll_position_state(
+        self,
+        asset: str,
+        *,
+        expect_open: bool,
+        attempts: int,
+        delay_seconds: float,
+    ) -> dict[str, Any]:
+        """Poll account state until a position appears or disappears."""
+        last_state: dict[str, Any] = {}
+        for _ in range(max(1, attempts)):
+            await asyncio.sleep(delay_seconds)
+            last_state = await self.broker.get_user_state()
+            position = self._find_position(last_state, asset)
+            if expect_open and position is not None:
+                return last_state
+            if not expect_open and position is None:
+                return last_state
+        return last_state

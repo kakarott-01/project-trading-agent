@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+if git grep -nE '0x[0-9a-fA-F]{64}' -- . ':!*.example' ':!.env.example' >/dev/null 2>&1; then
+    echo "ERROR: Real private key detected in tracked files. Aborting commit."
+    exit 1
+fi
+
+if grep -nE '0x[0-9a-fA-F]{64}' .env .env.* 2>/dev/null | grep -v 'example' >/dev/null 2>&1; then
+    echo "ERROR: Real private key detected in env file. Aborting commit."
+    exit 1
+fi

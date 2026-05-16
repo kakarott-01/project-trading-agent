@@ -3,11 +3,13 @@
 Supports one active provider at a time: Anthropic, OpenAI, or Gemini.
 """
 
+import hashlib
 import json
 import logging
 from datetime import datetime
 
 from src.config import Settings, get_settings
+from src.utils.log_files import append_text_log
 
 
 class TradingAgent:
@@ -135,8 +137,8 @@ class TradingAgent:
             item = dict(item)
             item.setdefault("action", "hold")
             item.setdefault("allocation_usd", 0.0)
-            item.setdefault("order_type", "market")
-            item.setdefault("limit_price", None)
+            item["order_type"] = "market"
+            item["limit_price"] = None
             item.setdefault("tp_price", None)
             item.setdefault("sl_price", None)
             item.setdefault("exit_plan", "")
@@ -195,10 +197,11 @@ class TradingAgent:
             "You are a strict JSON normalizer. Return ONLY a JSON object with two keys: "
             "\"reasoning\" (string) and \"trade_decisions\" (array). "
             "Each trade_decisions item must have: asset, action (buy/sell/hold), "
-            "allocation_usd (number), order_type (\"market\" or \"limit\"), "
-            "limit_price (number or null), tp_price (number or null), sl_price (number or null), "
+            "allocation_usd (number), order_type (\"market\" only), "
+            "limit_price (null), tp_price (number or null), sl_price (number or null), "
             "exit_plan (string), rationale (string). "
             f"Valid assets: {json.dumps(list(assets_list))}. "
+            "Limit entry orders are disabled; always set order_type to \"market\" and limit_price to null. "
             "If input is wrapped in markdown or has prose, extract just the JSON. Do not add fields."
         )
 
@@ -275,10 +278,10 @@ class TradingAgent:
             "- Choose one: buy / sell / hold.\n"
             "- Proactively harvest profits when price action presents a clear, high-quality opportunity that aligns with your thesis.\n"
             "- You control allocation_usd (but the system will cap it - see risk limits below).\n"
-            "- Order type: set order_type to \"market\" for immediate execution, or \"limit\" for resting orders.\n"
-            "  - For limit orders, you MUST set limit_price. Use limit orders when you want better entry prices (e.g., buying a dip, selling a bounce).\n"
-            "  - For market orders, limit_price should be null.\n"
-            "  - Default is \"market\" if omitted.\n"
+            "- All entry orders are submitted as market orders in this fail-closed execution mode.\n"
+            "  - Always set order_type to \"market\".\n"
+            "  - Always set limit_price to null.\n"
+            "  - Do not plan resting limit entries; they are rejected by risk controls.\n"
             "- TP/SL sanity:\n"
             "  - BUY: tp_price > current_price, sl_price < current_price\n"
             "  - SELL: tp_price < current_price, sl_price > current_price\n"
@@ -299,23 +302,30 @@ class TradingAgent:
             "  - \"reasoning\": long-form string capturing detailed, step-by-step analysis.\n"
             "  - \"trade_decisions\": array ordered to match the provided assets list.\n"
             "- Each item inside trade_decisions must contain the keys: asset, action, allocation_usd, order_type, limit_price, tp_price, sl_price, exit_plan, rationale.\n"
-            "  - order_type: \"market\" (default) or \"limit\"\n"
-            "  - limit_price: required if order_type is \"limit\", null otherwise\n"
+            "  - order_type: \"market\" only\n"
+            "  - limit_price: null\n"
             "- Do not emit Markdown or any extra properties.\n"
         )
 
         messages = [{"role": "user", "content": context}]
 
         def _log_request(model, messages_to_log):
-            with open("llm_requests.log", "a", encoding="utf-8") as f:
-                f.write(f"\n\n=== {datetime.now()} ===\n")
-                f.write(f"Provider: {self.provider}\n")
-                f.write(f"Model: {model}\n")
-                f.write(f"Messages count: {len(messages_to_log)}\n")
-                last = messages_to_log[-1]
-                content_str = str(last.get("content", ""))[:500]
-                f.write(f"Last message role: {last.get('role')}\n")
-                f.write(f"Last message content (truncated): {content_str}\n")
+            last = messages_to_log[-1]
+            content = str(last.get("content", ""))
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            append_text_log(
+                "llm_requests.log",
+                (
+                    f"\n\n=== {datetime.now()} ===\n"
+                    f"Provider: {self.provider}\n"
+                    f"Model: {model}\n"
+                    f"Messages count: {len(messages_to_log)}\n"
+                    f"Last message role: {last.get('role')}\n"
+                    f"Last message length: {len(content)} chars\n"
+                    f"Last message sha256: {content_hash}\n"
+                ),
+                private=True,
+            )
 
         def _call_anthropic(msgs, use_tools=True):
             _log_request(self.model, msgs)
@@ -343,11 +353,14 @@ class TradingAgent:
                 response.stop_reason,
                 response.usage,
             )
-            with open("llm_requests.log", "a", encoding="utf-8") as f:
-                f.write(f"Response stop_reason: {response.stop_reason}\n")
-                f.write(
+            append_text_log(
+                "llm_requests.log",
+                (
+                    f"Response stop_reason: {response.stop_reason}\n"
                     f"Usage: input={response.usage.input_tokens}, output={response.usage.output_tokens}\n"
-                )
+                ),
+                private=True,
+            )
             return response
 
         def _handle_tool_call(tool_name, tool_input):
@@ -365,8 +378,7 @@ class TradingAgent:
                     response = _call_anthropic(messages)
                 except Exception as ex:
                     logging.error("Anthropic API error: %s", ex)
-                    with open("llm_requests.log", "a", encoding="utf-8") as f:
-                        f.write(f"API Error: {ex}\n")
+                    append_text_log("llm_requests.log", f"API Error: {ex}\n", private=True)
                     break
 
                 tool_use_blocks = [b for b in response.content if b.type == "tool_use"]

@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import date, datetime, timezone
 from typing import Any
 
 ACTIVE_TRADES_FILE = "active_trades.json"
 RISK_STATE_FILE = "risk_state.json"
+_SAVE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -33,14 +35,25 @@ def load_active_trades() -> list[dict]:
 
 
 def save_active_trades(trades: list[dict]) -> None:
-    """Atomically write active trades to disk."""
-    tmp = ACTIVE_TRADES_FILE + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(trades, f, default=str)
-        os.replace(tmp, ACTIVE_TRADES_FILE)
-    except OSError as exc:
-        logging.error("Failed to save active_trades: %s", exc)
+    """Atomically write active trades to disk.
+
+    The existing file remains valid if the process dies before ``os.replace``;
+    stale ``.tmp`` files are ignored by ``load_active_trades`` on restart.
+    """
+    tmp = f"{ACTIVE_TRADES_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
+    with _SAVE_LOCK:
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(trades, f, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, ACTIVE_TRADES_FILE)
+        except OSError as exc:
+            logging.error("Failed to save active_trades: %s", exc)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------

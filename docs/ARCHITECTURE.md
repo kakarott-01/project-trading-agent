@@ -70,7 +70,7 @@ Each cycle in `src/main.py` follows this sequence:
    - same direction => combine allocations
    - conflicting directions => hold for that asset
 8. For actionable trades, run risk validation and adjustments.
-9. Set leverage on exchange, place order (market/limit), then attach TP/SL triggers when provided.
+9. Set leverage on exchange, place a market entry order, then attach TP/SL triggers when provided.
 10. Persist cycle and trade logs.
 
 ### 3) Decision Data Contract
@@ -80,8 +80,8 @@ Internal normalized decision keys:
 - `asset`
 - `action` (`buy` | `sell` | `hold`)
 - `allocation_usd`
-- `order_type` (`market` | `limit`)
-- `limit_price`
+- `order_type` (`market` only)
+- `limit_price` (`null`; resting limit entries are disabled)
 - `tp_price`
 - `sl_price`
 - `exit_plan`
@@ -142,5 +142,4 @@ Per-source decisions are scaled to source budget before cross-source merge.
 - Strategy conflicts degrade to hold decisions.
 
 Overall design principle: when uncertain, fail closed (hold), not open (trade).
-
 

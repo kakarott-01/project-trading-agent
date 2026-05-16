@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from datetime import datetime, timezone
 
@@ -14,6 +13,7 @@ from src.application.reconciliation_service import ReconciliationService
 from src.domain.models import ActiveTradeRecord, DecisionContext, InvocationMetadata
 from src.risk_manager import RiskManager
 from src.strategies.base import Strategy
+from src.utils.log_files import append_jsonl
 from src.utils.state_persistence import load_active_trades, save_active_trades
 
 
@@ -81,26 +81,40 @@ class CycleRunner:
             self.invocation_count += 1
             minutes_since_start = (cycle_start - self.start_time).total_seconds() / 60
 
+            open_orders: list[dict] = []
             try:
-                state, account_value = await self.market_data_service.fetch_account_state()
+                open_orders = await self.market_data_service.broker.get_open_orders()
+                state, account_value = await self.market_data_service.fetch_account_state(
+                    open_orders=open_orders
+                )
                 await self.reconciliation_service.force_close_losers(
                     state, self.active_trades, cycle_start
                 )
-                state, account_value = await self.market_data_service.fetch_account_state()
+                open_orders = await self.market_data_service.broker.get_open_orders()
+                state, account_value = await self.market_data_service.fetch_account_state(
+                    open_orders=open_orders
+                )
             except Exception as exc:
                 logging.error("Risk force-close error: %s", exc)
-                state, account_value = await self.market_data_service.fetch_account_state()
+                open_orders = await self.market_data_service.broker.get_open_orders()
+                state, account_value = await self.market_data_service.fetch_account_state(
+                    open_orders=open_orders
+                )
 
             try:
                 open_orders = await self.reconciliation_service.reconcile_active_trades(
-                    state, self.active_trades, cycle_start, tracked_assets=self.assets
+                    state,
+                    self.active_trades,
+                    cycle_start,
+                    tracked_assets=self.assets,
+                    open_orders=open_orders,
                 )
             except Exception as exc:
                 logging.error("Reconcile error: %s", exc)
                 open_orders = []
 
             try:
-                state = await self.market_data_service.broker.get_user_state()
+                state = await self.market_data_service.broker.get_user_state(open_orders=open_orders)
                 account_value = float(state.get("total_value") or account_value)
             except Exception as exc:
                 logging.error("State refresh after reconcile failed: %s", exc)
@@ -118,6 +132,7 @@ class CycleRunner:
             )
             if cancelled_pending > 0:
                 open_orders = await self.market_data_service.broker.get_open_orders()
+                state = await self.market_data_service.broker.get_user_state(open_orders=open_orders)
 
             trading_halted = self.risk_manager.circuit_breaker_active
             if trading_halted:
@@ -267,8 +282,7 @@ class CycleRunner:
 
     def _append_diary(self, entry: dict) -> None:
         try:
-            with open(self.diary_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(entry) + "\n")
+            append_jsonl(self.diary_path, entry)
         except Exception:
             logging.exception("Failed to append cycle diary entry")
 
@@ -300,7 +314,6 @@ class CycleRunner:
             "balance": round(float(balance), 2),
         }
         try:
-            with open(self.decisions_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(cycle_log) + "\n")
+            append_jsonl(self.decisions_path, cycle_log)
         except Exception:
             pass

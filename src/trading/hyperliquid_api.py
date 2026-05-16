@@ -9,6 +9,7 @@ the trading agent can depend on predictable, non-blocking IO.
 import asyncio
 import logging
 import secrets
+import time as _time
 import aiohttp
 from typing import TYPE_CHECKING, Any
 from hyperliquid.exchange import Exchange
@@ -52,6 +53,7 @@ class HyperliquidAPI:
         self.settings = settings or get_settings()
         self._meta_cache = None
         self._hip3_meta_cache = {}  # {dex_name: meta_response}
+        self._candle_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
         if self.settings.hyperliquid.private_key:
             self.wallet = Account.from_key(self.settings.hyperliquid.private_key)
         elif self.settings.hyperliquid.mnemonic:
@@ -87,6 +89,11 @@ class HyperliquidAPI:
             logging.warning("Hyperliquid clients re-instantiated after connection issue")
         except (ValueError, AttributeError, RuntimeError) as e:
             logging.error("Failed to reset Hyperliquid clients: %s", e)
+
+    def _call_info_attr(self, name: str, *args):
+        """Call an Info SDK method, tolerating SDKs that expose simple properties."""
+        attr = getattr(self.info, name)
+        return attr(*args) if callable(attr) else attr
 
     async def _retry(self, fn, *args, max_attempts: int = 3, backoff_base: float = 0.5, reset_on_fail: bool = True, to_thread: bool = True, **kwargs):
         """Retry helper with exponential backoff and optional thread offloading.
@@ -557,12 +564,33 @@ class HyperliquidAPI:
         """Cancel every open order for ``asset`` owned by the configured wallet."""
         try:
             open_orders = await self._retry(lambda: self.info.frontend_open_orders(self.query_address))
+            cancelled_count = 0
             for order in open_orders:
                 if order.get("coin") == asset:
                     oid = order.get("oid")
                     if oid:
                         await self.cancel_order(asset, oid)
-            return {"status": "ok", "cancelled_count": len([o for o in open_orders if o.get("coin") == asset])}
+                        cancelled_count += 1
+
+            remaining = [
+                order
+                for order in await self.get_open_orders()
+                if order.get("coin") == asset
+            ]
+            if remaining:
+                logging.critical(
+                    "Cancel-all verification failed for %s: %d open orders remain: %s",
+                    asset,
+                    len(remaining),
+                    [order.get("oid") for order in remaining],
+                )
+                return {
+                    "status": "warning",
+                    "cancelled_count": cancelled_count,
+                    "remaining_count": len(remaining),
+                    "remaining_oids": [order.get("oid") for order in remaining],
+                }
+            return {"status": "ok", "cancelled_count": cancelled_count, "remaining_count": 0}
         except (RuntimeError, ValueError, KeyError, ConnectionError) as e:
             logging.error("Cancel all orders error for %s: %s", asset, e)
             return {"status": "error", "message": str(e)}
@@ -628,7 +656,7 @@ class HyperliquidAPI:
         """
         return self.summarize_order_result(order_result)["all_oids"]
 
-    async def get_user_state(self):
+    async def get_user_state(self, open_orders: list[dict[str, Any]] | None = None):
         """Retrieve wallet state with enriched position PnL calculations.
 
         Supports both standard and unified accounts. For unified accounts,
@@ -680,7 +708,8 @@ class HyperliquidAPI:
             reconstructed_value = balance + sum(float(p.get("pnl", 0.0) or 0.0) for p in enriched_positions)
             total_value = reconstructed_value
 
-        open_orders = await self.get_open_orders()
+        if open_orders is None:
+            open_orders = await self.get_open_orders()
         pending_entry_orders: list[dict[str, Any]] = []
         pending_entry_assets: set[str] = set()
         for order in open_orders:
@@ -740,7 +769,9 @@ class HyperliquidAPI:
                 lambda: self.info.post("/info", {"type": "allMids", "dex": dex})
             )
         else:
-            mids = await self._retry(self.info.all_mids)
+            # The lambda intentionally captures ``self`` so a retry after
+            # _reset_clients() uses the new Info client.
+            mids = await self._retry(lambda: self._call_info_attr("all_mids"))
         return float(mids.get(asset, 0.0))
 
     async def get_meta_and_ctxs(self, dex=None):
@@ -763,7 +794,9 @@ class HyperliquidAPI:
                     # Store as {dex: {"universe": [...]}}
             return self._hip3_meta_cache.get(dex)
         if not self._meta_cache:
-            response = await self._retry(self.info.meta_and_asset_ctxs)
+            # The lambda intentionally captures ``self`` so a retry after
+            # _reset_clients() uses the new Info client.
+            response = await self._retry(lambda: self._call_info_attr("meta_and_asset_ctxs"))
             self._meta_cache = response
         return self._meta_cache
 
@@ -802,8 +835,6 @@ class HyperliquidAPI:
         Returns:
             List of dicts with keys: t, open, high, low, close, volume.
         """
-        import time as _time
-
         # Map interval to approximate milliseconds to compute startTime
         interval_ms_map = {
             "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
@@ -813,7 +844,13 @@ class HyperliquidAPI:
         }
         interval_ms = interval_ms_map.get(interval, 300_000)
         end_time = int(_time.time() * 1000)
-        start_time = end_time - (count * interval_ms)
+        cache_key = (asset, interval)
+        cached = self._candle_cache.get(cache_key, [])
+        if cached:
+            last_open = self._safe_float(cached[-1].get("t"))
+            start_time = max(0, int(last_open or 0) - interval_ms)
+        else:
+            start_time = end_time - (count * interval_ms)
 
         if ":" in asset:
             # HIP-3 asset — SDK candles_snapshot can't resolve dex:asset names,
@@ -839,7 +876,23 @@ class HyperliquidAPI:
                 "close": float(c.get("c", 0)),
                 "volume": float(c.get("v", 0)),
             })
-        return candles
+
+        if cached:
+            merged_by_time = {
+                int(candle["t"]): candle
+                for candle in cached
+                if candle.get("t") is not None
+            }
+            for candle in candles:
+                if candle.get("t") is not None:
+                    merged_by_time[int(candle["t"])] = candle
+            merged = [merged_by_time[t] for t in sorted(merged_by_time)]
+        else:
+            merged = candles
+
+        trimmed = merged[-count:]
+        self._candle_cache[cache_key] = trimmed
+        return trimmed
 
     async def get_funding_rate(self, asset):
         """Return the most recent funding rate for ``asset`` if available.

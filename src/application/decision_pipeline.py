@@ -8,6 +8,7 @@ from collections import OrderedDict
 
 from src.domain.models import DecisionContext, StrategyResult, TradeIntent
 from src.strategies.base import Strategy
+from src.utils.log_files import append_text_log
 from src.utils.prompt_utils import json_default
 
 
@@ -136,11 +137,13 @@ class DecisionPipeline:
     def build_ai_prompt(self, context: DecisionContext) -> str:
         payload = OrderedDict(context.to_prompt_payload())
         try:
-            with open(self.prompt_log_path, "a", encoding="utf-8") as handle:
-                handle.write(
+            append_text_log(
+                self.prompt_log_path,
+                (
                     f"\n\n--- {context.invocation.current_time.isoformat()} ---\n"
                     f"{json.dumps(payload, indent=2, default=json_default)}\n"
-                )
+                ),
+            )
         except Exception:
             pass
         logging.info(

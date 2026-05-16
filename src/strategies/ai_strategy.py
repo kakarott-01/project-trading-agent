@@ -12,6 +12,7 @@ from src.config import Settings
 from src.domain.models import DecisionContext, StrategyResult, TradeIntent
 from src.exchanges.base import MarketDataPort
 from src.strategies.base import Strategy
+from src.strategies.executors import AI_EXECUTOR
 from src.utils.prompt_utils import json_default
 
 
@@ -45,9 +46,13 @@ class AIStrategy(Strategy):
             )
 
         try:
-            import asyncio
-
-            outputs = await asyncio.to_thread(self.agent.decide_trade, context.assets, prompt)
+            loop = asyncio.get_running_loop()
+            outputs = await loop.run_in_executor(
+                AI_EXECUTOR,
+                self.agent.decide_trade,
+                context.assets,
+                prompt,
+            )
         except Exception as exc:
             logging.error("Agent error: %s", exc)
             outputs = {}
@@ -61,7 +66,9 @@ class AIStrategy(Strategy):
                 ]
             )
             try:
-                outputs = await asyncio.to_thread(
+                loop = asyncio.get_running_loop()
+                outputs = await loop.run_in_executor(
+                    AI_EXECUTOR,
                     self.agent.decide_trade,
                     context.assets,
                     json.dumps(retry_payload, default=json_default),

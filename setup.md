@@ -200,3 +200,8 @@ alias use_gemini='cat .env.common .env.gemini > .env && echo Active profile: gem
 - Do not commit secrets.
 - Keep `.env` and private profile files ignored by git.
 - Rotate keys immediately if exposed.
+- Enable the repo hook checks once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
