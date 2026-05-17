@@ -11,6 +11,7 @@ from src.domain.models import DecisionContext, StrategyResult, TradeIntent
 from src.strategies.base import Strategy
 from src.utils.log_files import append_jsonl, append_text_log
 from src.utils.prompt_utils import json_default
+from src.utils.telegram_notifier import AlertCode, alert
 
 
 def _to_float_or_zero(value) -> float:
@@ -239,6 +240,15 @@ class DecisionPipeline:
                             else None
                         ),
                         "strategy_errors": strategy_errors,
+                    },
+                )
+            if self.cycles_without_actionable_decision >= 2:
+                alert(
+                    AlertCode.REPEATED_AI_FAILURE,
+                    f"No actionable decisions for {self.cycles_without_actionable_decision} consecutive cycles.",
+                    action_required="Check AI API status. Bot is safely holding positions.",
+                    details={
+                        "consecutive_empty": str(self.cycles_without_actionable_decision)
                     },
                 )
         return all_source_decisions, reasoning_chunks

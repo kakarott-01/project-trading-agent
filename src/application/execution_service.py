@@ -13,6 +13,7 @@ from src.exchanges.base import ExecutionPort, MarketDataPort
 from src.risk_manager import RiskManager
 from src.utils.log_files import append_jsonl
 from src.utils.state_persistence import save_active_trades
+from src.utils.telegram_notifier import AlertCode, alert
 
 
 class ExecutionService:
@@ -497,6 +498,20 @@ class ExecutionService:
             )
             return
 
+        if synced_trade.status == "open_position":
+            fill_price = self._safe_float(synced_trade.entry_price) or current_price
+            filled_amount = self._safe_float(
+                synced_trade.actual_filled or synced_trade.amount
+            ) or amount
+            sl_price = self._safe_float(synced_trade.sl_price) or 0.0
+            alert(
+                AlertCode.POSITION_OPENED,
+                f"{'LONG' if is_buy else 'SHORT'} {asset}: "
+                f"Entry={fill_price:.4f} Size={filled_amount:.4f} Lev={leverage}x "
+                f"SL={sl_price:.4f}",
+                asset=asset,
+            )
+
         trade_log.append(
             {
                 "type": adjusted_intent.action,
@@ -617,6 +632,21 @@ class ExecutionService:
         )
         live_position = self._find_position(post_state, asset)
         fully_closed = live_position is None
+        if fully_closed:
+            was_long = float(current_position.get("szi") or 0.0) > 0
+            entry_px = self._safe_float(current_position.get("entryPx")) or 0.0
+            close_px = self._safe_float(summary.get("avg_fill_price"))
+            if close_px is None:
+                close_px = self._safe_float(current_position.get("markPx")) or entry_px
+            realized_pnl = (close_px - entry_px) * size * (1 if was_long else -1)
+            close_reason = "opposite_direction_signal"
+            alert(
+                AlertCode.POSITION_CLOSED,
+                f"{'LONG' if was_long else 'SHORT'} {asset} CLOSED. "
+                f"PnL: {realized_pnl:+.4f} USDC. Reason: {close_reason}",
+                asset=asset,
+                details={"pnl": f"{realized_pnl:+.4f}", "reason": close_reason},
+            )
         if not fully_closed:
             alarm = {
                 "timestamp": cycle_start.isoformat(),

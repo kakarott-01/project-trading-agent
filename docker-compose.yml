@@ -1,50 +1,188 @@
-services:
-  trading-bot:
-    build: .
-    restart: always
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      TRADING_DATA_DIR: /app/data
-    volumes:
-      - ./algo.py:/app/algo.py:ro
-      - ./data:/app/data
-    ports:
-      - "${API_PORT:-3000}:3000"
+# ─────────────────────────────────────────────────────────────────────────────
+# Hyperliquid AI Trading Bot — Production Docker Compose
+# Single-user, self-hosted deployment
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage:
+#   docker compose up -d            # start all services
+#   docker compose logs -f bot      # follow bot logs
+#   docker compose ps               # check health
+#   docker compose down             # stop (does NOT delete volumes)
+# ─────────────────────────────────────────────────────────────────────────────
 
-  state-backup:
-    image: rclone/rclone:1.66
+version: "3.9"
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+
+  # ─── PRIMARY TRADING BOT ────────────────────────────────────────────────────
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: "3.12.8"
+    container_name: trading-bot
     restart: always
-    profiles:
-      - backup
-    environment:
-      BACKUP_REMOTE: "${BACKUP_REMOTE:-}"
+
+    env_file:
+      - .env
+
     volumes:
-      - ./data:/data:ro
+      # Persistent state — survives container restarts
+      - bot-data:/app/data
+      # Custom strategy — mounted read-only so live edits don't corrupt state
+      - ./algo.py:/app/algo.py:ro
+      # Log directory — accessible from host for monitoring
+      - ./logs:/app/logs
+
+    ports:
+      # API server — localhost ONLY. Never expose to 0.0.0.0 in production.
+      - "127.0.0.1:${API_PORT:-3000}:3000"
+
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - |
+          import urllib.request, os, sys
+          secret = os.environ.get('API_SECRET', '')
+          port = os.environ.get('API_PORT', '3000')
+          url = f'http://localhost:{port}/health?key={secret}'
+          try:
+              urllib.request.urlopen(url, timeout=5)
+              sys.exit(0)
+          except Exception as e:
+              print(f'Health check failed: {e}')
+              sys.exit(1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging: *default-logging
+
+    # Resource limits — adjust for your VPS tier
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.5"
+        reservations:
+          memory: 256M
+          cpus: "0.25"
+
+    depends_on:
+      - telegram-health-probe
+
+    labels:
+      com.trading-bot.service: "primary"
+      com.trading-bot.version: "${BOT_VERSION:-unknown}"
+
+  # ─── TELEGRAM HEALTH PROBE ──────────────────────────────────────────────────
+  # Lightweight sidecar that sends a startup ping to Telegram when bot launches.
+  # This also validates your Telegram credentials before the bot starts.
+  telegram-health-probe:
+    image: python:3.12.8-slim
+    container_name: trading-bot-tg-probe
+    restart: "no"
+    env_file:
+      - .env
+    command: >
+      python -c "
+      import os, urllib.request, json, sys
+
+      token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+      chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
+      bot_name = os.environ.get('BOT_NAME', 'TradingBot')
+
+      if not token or not chat_id:
+          print('Telegram not configured — skipping probe')
+          sys.exit(0)
+
+      msg = f'🟢 [{bot_name}] Container starting up\nDocker service is initializing.'
+      data = json.dumps({'chat_id': chat_id, 'text': msg}).encode()
+      req = urllib.request.Request(
+          f'https://api.telegram.org/bot{token}/sendMessage',
+          data=data,
+          headers={'Content-Type': 'application/json'},
+          method='POST'
+      )
+      try:
+          urllib.request.urlopen(req, timeout=10)
+          print('Telegram probe: startup message sent')
+      except Exception as e:
+          print(f'Telegram probe failed (non-fatal): {e}')
+      "
+    logging: *default-logging
+
+  # ─── STATE BACKUP SERVICE ───────────────────────────────────────────────────
+  backup:
+    image: python:3.12.8-slim
+    container_name: trading-bot-backup
+    restart: always
+
+    env_file:
+      - .env
+
+    volumes:
+      - bot-data:/app/data:ro
+      - ./logs:/app/logs:ro
       - ./backups:/backups
-      - type: bind
-        source: ./rclone.conf
-        target: /config/rclone/rclone.conf
-        read_only: true
-        bind:
-          create_host_path: false
-    entrypoint: /bin/sh
-    command:
-      - -c
-      - |
-        set -eu
-        while true; do
-          stamp=$$(date -u +%Y%m%dT%H%M%SZ)
-          archive="/backups/trading-state-$${stamp}.tar.gz"
-          files=""
-          for f in active_trades.json risk_state.json diary.jsonl alarms.jsonl; do
-            if [ -f "/data/$${f}" ]; then files="$${files} $${f}"; fi
-          done
-          if [ -n "$${files}" ]; then tar -czf "$${archive}" -C /data $${files}; fi
-          if [ -n "$${BACKUP_REMOTE}" ] && [ -f "$${archive}" ]; then
-            rclone copy "$${archive}" "$${BACKUP_REMOTE}"
-          fi
-          find /backups -name 'trading-state-*.tar.gz' -mtime +7 -delete
-          sleep 300
-        done
+      - ./scripts/backup_worker.py:/backup_worker.py:ro
+
+    command: python /backup_worker.py
+
+    environment:
+      BACKUP_INTERVAL_SECONDS: "${BACKUP_INTERVAL_SECONDS:-300}"
+      BACKUP_RETAIN_COUNT: "${BACKUP_RETAIN_COUNT:-144}"  # 12 hours at 5-min intervals
+      BACKUP_DIR: "/backups"
+      DATA_DIR: "/app/data"
+      # Optional: rclone remote for off-VPS backup
+      RCLONE_REMOTE: "${RCLONE_REMOTE:-}"
+
+    logging: *default-logging
+
+    depends_on:
+      - bot
+
+  # ─── LOG ROTATION WATCHER ───────────────────────────────────────────────────
+  # Ensures log files don't grow unbounded and kill the VPS disk
+  logrotate:
+    image: python:3.12.8-slim
+    container_name: trading-bot-logrotate
+    restart: always
+
+    volumes:
+      - bot-data:/app/data
+      - ./logs:/app/logs
+      - ./scripts/logrotate_worker.py:/logrotate_worker.py:ro
+
+    command: python /logrotate_worker.py
+
+    environment:
+      LOG_DIR: "/app/logs"
+      DATA_DIR: "/app/data"
+      MAX_FILE_SIZE_MB: "${LOG_MAX_SIZE_MB:-50}"
+      CHECK_INTERVAL_SECONDS: "300"
+
+    logging: *default-logging
+
+# ─── VOLUMES ──────────────────────────────────────────────────────────────────
+volumes:
+  bot-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "${DATA_DIR:-./data}"
+
+# ─── NETWORKS ─────────────────────────────────────────────────────────────────
+networks:
+  default:
+    name: trading-bot-net

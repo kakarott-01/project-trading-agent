@@ -12,6 +12,7 @@ from src.exchanges.base import ExecutionPort, MarketDataPort
 from src.risk_manager import RiskManager
 from src.utils.log_files import append_jsonl
 from src.utils.state_persistence import save_active_trades
+from src.utils.telegram_notifier import AlertCode, alert
 
 
 class ReconciliationService:
@@ -419,15 +420,33 @@ class ReconciliationService:
                     trade.asset,
                     summary["error_messages"],
                 )
+                alert(
+                    AlertCode.STOP_LOSS_REPAIR_FAILED,
+                    f"Stop-loss repair for {trade.asset} exhausted all retries. Attempting market close.",
+                    asset=trade.asset,
+                    action_required="Emergency flatten in progress — monitor closely.",
+                )
                 return False
         except Exception as exc:
             logging.error("Failed to install SL for %s: %s", trade.asset, exc)
+            alert(
+                AlertCode.STOP_LOSS_REPAIR_FAILED,
+                f"Stop-loss repair for {trade.asset} exhausted all retries. Attempting market close.",
+                asset=trade.asset,
+                action_required="Emergency flatten in progress — monitor closely.",
+            )
             return False
 
         refreshed_orders = await self.broker.get_open_orders()
         _, refreshed_reduce_orders = self._split_asset_orders(refreshed_orders, trade.asset)
         _, refreshed_sl_orders = self._extract_trigger_orders(refreshed_reduce_orders)
         if not refreshed_sl_orders:
+            alert(
+                AlertCode.STOP_LOSS_REPAIR_FAILED,
+                f"Stop-loss repair for {trade.asset} exhausted all retries. Attempting market close.",
+                asset=trade.asset,
+                action_required="Emergency flatten in progress — monitor closely.",
+            )
             return False
 
         coverage = sum(order["size"] for order in refreshed_sl_orders)
@@ -438,6 +457,12 @@ class ReconciliationService:
             == round(live_sl_price, 8)
         )
         if coverage < size * 0.999 or not live_sl_valid:
+            alert(
+                AlertCode.STOP_LOSS_REPAIR_FAILED,
+                f"Stop-loss repair for {trade.asset} exhausted all retries. Attempting market close.",
+                asset=trade.asset,
+                action_required="Emergency flatten in progress — monitor closely.",
+            )
             return False
 
         trade.sl_oid = str(refreshed_sl_orders[0]["oid"])
@@ -494,6 +519,23 @@ class ReconciliationService:
                 await asyncio.sleep(1)
 
         trade.status = "fail_closed_flattened" if close_ok else "failed_no_stop"
+        if trade.status == "failed_no_stop":
+            alert(
+                AlertCode.FAILED_NO_STOP,
+                f"POSITION {trade.asset} HAS NO STOP LOSS — all repair and flatten attempts failed.\n"
+                f"Position is LIVE and UNPROTECTED.",
+                asset=trade.asset,
+                action_required=(
+                    "1. Open Hyperliquid NOW.\n"
+                    "2. Manually set a stop-loss OR close the position entirely.\n"
+                    "3. Check /alarms for full detail."
+                ),
+                details={
+                    "size": str(getattr(trade, "amount", "?")),
+                    "entry_px": str(getattr(trade, "entry_price", "?")),
+                    "direction": "long" if getattr(trade, "is_long", False) else "short",
+                },
+            )
         trade.tp_oid = None
         trade.sl_oid = None
         trade.last_synced_at = cycle_start.isoformat()

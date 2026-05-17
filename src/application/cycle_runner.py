@@ -15,6 +15,7 @@ from src.risk_manager import RiskManager
 from src.strategies.base import Strategy
 from src.utils.log_files import append_jsonl
 from src.utils.state_persistence import load_active_trades, save_active_trades
+from src.utils.telegram_notifier import AlertCode, alert
 
 
 def get_interval_seconds(interval_str: str) -> int:
@@ -74,162 +75,177 @@ class CycleRunner:
         await self._bootstrap_reconciliation_until_ready()
 
         while not self.shutdown_event.is_set():
-            cycle_start = datetime.now(timezone.utc)
-            self.invocation_count += 1
-            minutes_since_start = (cycle_start - self.start_time).total_seconds() / 60
-
-            open_orders: list[dict] = []
             try:
-                open_orders = await self.market_data_service.broker.get_open_orders()
-                state, account_value = await self.market_data_service.fetch_account_state(
-                    open_orders=open_orders
-                )
-                await self.reconciliation_service.force_close_losers(
-                    state, self.active_trades, cycle_start
-                )
-                open_orders = await self.market_data_service.broker.get_open_orders()
-                state, account_value = await self.market_data_service.fetch_account_state(
-                    open_orders=open_orders
-                )
+                await self._run_single_cycle(interval_secs)
             except Exception as exc:
-                logging.error("Risk force-close error: %s", exc)
-                open_orders = await self.market_data_service.broker.get_open_orders()
-                state, account_value = await self.market_data_service.fetch_account_state(
-                    open_orders=open_orders
+                logging.critical("Unexpected cycle exception: %s", exc, exc_info=True)
+                alert(
+                    AlertCode.UNEXPECTED_EXCEPTION,
+                    f"Unexpected exception: {type(exc).__name__}: {str(exc)[:200]}",
+                    action_required="Check trading.log. Bot will retry next cycle.",
                 )
-
-            try:
-                open_orders = await self.reconciliation_service.reconcile_active_trades(
-                    state,
-                    self.active_trades,
-                    cycle_start,
-                    tracked_assets=self.assets,
-                    open_orders=open_orders,
-                )
-            except Exception as exc:
-                logging.error("Reconcile error: %s", exc)
-                open_orders = []
-
-            try:
-                state = await self.market_data_service.broker.get_user_state(open_orders=open_orders)
-                account_value = float(state.get("total_value") or account_value)
-            except Exception as exc:
-                logging.error("State refresh after reconcile failed: %s", exc)
-
-            drawdown_ok, drawdown_reason = self.risk_manager.check_daily_drawdown(
-                account_value,
-                float(state.get("balance", 0) or 0),
-            )
-            if not drawdown_ok:
-                logging.warning("Risk breaker state: %s", drawdown_reason)
-
-            cancelled_pending = await self._cancel_pending_entries_outside_limits(
-                state=state,
-                cycle_start=cycle_start,
-            )
-            if cancelled_pending > 0:
-                open_orders = await self.market_data_service.broker.get_open_orders()
-                state = await self.market_data_service.broker.get_user_state(open_orders=open_orders)
-
-            trading_halted = self.risk_manager.circuit_breaker_active
-            if trading_halted:
-                logging.warning(
-                    "Circuit breaker active: skipping new trade decisions this cycle"
-                )
-
-            try:
-                fills = await self.market_data_service.broker.get_recent_fills(limit=50)
-            except Exception:
-                fills = []
-
-            dashboard = await self.market_data_service.build_dashboard(
-                state=state,
-                account_value=account_value,
-                trade_log=self.trade_log,
-                active_trades=self.active_trades,
-                open_orders=open_orders,
-                fills=fills,
-            )
-
-            market_snapshots, asset_prices = await self.market_data_service.build_market_snapshots(
-                self.assets, cycle_start
-            )
-
-            invocation = InvocationMetadata(
-                minutes_since_start=minutes_since_start,
-                current_time=cycle_start,
-                invocation_count=self.invocation_count,
-                interval=self.interval,
-            )
-
-            if trading_halted:
-                reasoning_chunks = [
-                    "Trading halted: daily loss circuit breaker active; pending entry orders are being cancelled.",
-                ]
-                merged_decisions = []
-            else:
-                strategy_contexts = []
-                for strategy, capital_pct in self.strategies:
-                    capital_budget_usd = account_value * (capital_pct / 100.0)
-                    strategy_contexts.append(
-                        (
-                            strategy,
-                            DecisionContext(
-                                assets=self.assets,
-                                market_snapshots=market_snapshots,
-                                account_dashboard=dashboard,
-                                risk_limits=self.risk_manager.get_risk_summary(),
-                                invocation=invocation,
-                                capital_budget_usd=capital_budget_usd,
-                                capital_pct=capital_pct,
-                                provider_label=strategy.source,
-                            ),
-                        )
-                    )
-
-                all_source_decisions, reasoning_chunks = await self.decision_pipeline.run_strategies(
-                    strategy_contexts
-                )
-                merged_decisions = self.decision_pipeline.merge_trade_decisions(
-                    all_source_decisions, self.assets
-                )
-            self._persist_cycle_log(
-                cycle_start=cycle_start,
-                reasoning_chunks=reasoning_chunks,
-                merged_decisions=merged_decisions,
-                account_value=account_value,
-                balance=state["balance"],
-            )
-
-            if not trading_halted:
-                await self.execution_service.execute(
-                    intents=merged_decisions,
-                    assets=self.assets,
-                    cycle_start=cycle_start,
-                    asset_prices=asset_prices,
-                    active_trades=self.active_trades,
-                    shutdown_event=self.shutdown_event,
-                    trade_log=self.trade_log,
-                )
-
-            elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
-            sleep_for = max(0.0, interval_secs - elapsed)
-            if sleep_for < interval_secs * 0.1:
-                logging.warning(
-                    "Cycle %d took %.1fs (%.0f%% of %ds interval) — barely any sleep remaining",
-                    self.invocation_count,
-                    elapsed,
-                    elapsed / interval_secs * 100,
-                    interval_secs,
-                )
-            if sleep_for > 0:
                 try:
-                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=sleep_for)
+                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=interval_secs)
                 except asyncio.TimeoutError:
                     pass
 
         logging.info("Bot loop exited cleanly after %d cycles", self.invocation_count)
         save_active_trades([trade.to_dict() for trade in self.active_trades])
+
+    async def _run_single_cycle(self, interval_secs: int) -> None:
+        cycle_start = datetime.now(timezone.utc)
+        self.invocation_count += 1
+        minutes_since_start = (cycle_start - self.start_time).total_seconds() / 60
+
+        open_orders: list[dict] = []
+        try:
+            open_orders = await self.market_data_service.broker.get_open_orders()
+            state, account_value = await self.market_data_service.fetch_account_state(
+                open_orders=open_orders
+            )
+            await self.reconciliation_service.force_close_losers(
+                state, self.active_trades, cycle_start
+            )
+            open_orders = await self.market_data_service.broker.get_open_orders()
+            state, account_value = await self.market_data_service.fetch_account_state(
+                open_orders=open_orders
+            )
+        except Exception as exc:
+            logging.error("Risk force-close error: %s", exc)
+            open_orders = await self.market_data_service.broker.get_open_orders()
+            state, account_value = await self.market_data_service.fetch_account_state(
+                open_orders=open_orders
+            )
+
+        try:
+            open_orders = await self.reconciliation_service.reconcile_active_trades(
+                state,
+                self.active_trades,
+                cycle_start,
+                tracked_assets=self.assets,
+                open_orders=open_orders,
+            )
+        except Exception as exc:
+            logging.error("Reconcile error: %s", exc)
+            open_orders = []
+
+        try:
+            state = await self.market_data_service.broker.get_user_state(open_orders=open_orders)
+            account_value = float(state.get("total_value") or account_value)
+        except Exception as exc:
+            logging.error("State refresh after reconcile failed: %s", exc)
+
+        drawdown_ok, drawdown_reason = self.risk_manager.check_daily_drawdown(
+            account_value,
+            float(state.get("balance", 0) or 0),
+        )
+        if not drawdown_ok:
+            logging.warning("Risk breaker state: %s", drawdown_reason)
+
+        cancelled_pending = await self._cancel_pending_entries_outside_limits(
+            state=state,
+            cycle_start=cycle_start,
+        )
+        if cancelled_pending > 0:
+            open_orders = await self.market_data_service.broker.get_open_orders()
+            state = await self.market_data_service.broker.get_user_state(open_orders=open_orders)
+
+        trading_halted = self.risk_manager.circuit_breaker_active
+        if trading_halted:
+            logging.warning(
+                "Circuit breaker active: skipping new trade decisions this cycle"
+            )
+
+        try:
+            fills = await self.market_data_service.broker.get_recent_fills(limit=50)
+        except Exception:
+            fills = []
+
+        dashboard = await self.market_data_service.build_dashboard(
+            state=state,
+            account_value=account_value,
+            trade_log=self.trade_log,
+            active_trades=self.active_trades,
+            open_orders=open_orders,
+            fills=fills,
+        )
+
+        market_snapshots, asset_prices = await self.market_data_service.build_market_snapshots(
+            self.assets, cycle_start
+        )
+
+        invocation = InvocationMetadata(
+            minutes_since_start=minutes_since_start,
+            current_time=cycle_start,
+            invocation_count=self.invocation_count,
+            interval=self.interval,
+        )
+
+        if trading_halted:
+            reasoning_chunks = [
+                "Trading halted: daily loss circuit breaker active; pending entry orders are being cancelled.",
+            ]
+            merged_decisions = []
+        else:
+            strategy_contexts = []
+            for strategy, capital_pct in self.strategies:
+                capital_budget_usd = account_value * (capital_pct / 100.0)
+                strategy_contexts.append(
+                    (
+                        strategy,
+                        DecisionContext(
+                            assets=self.assets,
+                            market_snapshots=market_snapshots,
+                            account_dashboard=dashboard,
+                            risk_limits=self.risk_manager.get_risk_summary(),
+                            invocation=invocation,
+                            capital_budget_usd=capital_budget_usd,
+                            capital_pct=capital_pct,
+                            provider_label=strategy.source,
+                        ),
+                    )
+                )
+
+            all_source_decisions, reasoning_chunks = await self.decision_pipeline.run_strategies(
+                strategy_contexts
+            )
+            merged_decisions = self.decision_pipeline.merge_trade_decisions(
+                all_source_decisions, self.assets
+            )
+        self._persist_cycle_log(
+            cycle_start=cycle_start,
+            reasoning_chunks=reasoning_chunks,
+            merged_decisions=merged_decisions,
+            account_value=account_value,
+            balance=state["balance"],
+        )
+
+        if not trading_halted:
+            await self.execution_service.execute(
+                intents=merged_decisions,
+                assets=self.assets,
+                cycle_start=cycle_start,
+                asset_prices=asset_prices,
+                active_trades=self.active_trades,
+                shutdown_event=self.shutdown_event,
+                trade_log=self.trade_log,
+            )
+
+        elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+        sleep_for = max(0.0, interval_secs - elapsed)
+        if sleep_for < interval_secs * 0.1:
+            logging.warning(
+                "Cycle %d took %.1fs (%.0f%% of %ds interval) — barely any sleep remaining",
+                self.invocation_count,
+                elapsed,
+                elapsed / interval_secs * 100,
+                interval_secs,
+            )
+        if sleep_for > 0:
+            try:
+                await asyncio.wait_for(self.shutdown_event.wait(), timeout=sleep_for)
+            except asyncio.TimeoutError:
+                pass
 
     async def _bootstrap_reconciliation_until_ready(self) -> None:
         """Fail closed on startup until exchange state has been reconciled."""
@@ -245,6 +261,13 @@ class CycleRunner:
                 logging.critical(
                     "Startup reconciliation failed; trading is paused and will retry in 30s: %s",
                     exc,
+                    exc_info=True,
+                )
+                alert(
+                    AlertCode.STARTUP_RECONCILIATION_FAILED,
+                    f"Bot started but CANNOT reconcile with exchange.\nError: {exc}\n"
+                    f"Retrying every 30s before accepting trades.",
+                    action_required="Check exchange connectivity. Bot will retry automatically.",
                 )
                 self._append_diary(
                     {

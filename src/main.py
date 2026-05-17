@@ -19,6 +19,7 @@ except ImportError:
 from src.app.bootstrap import ApplicationRuntime
 from src.config import get_settings
 from src.utils.paths import data_path
+from src.utils.telegram_notifier import AlertCode, alert, init_telegram_notifier
 
 load_dotenv(override=True)
 
@@ -95,6 +96,14 @@ async def main_async() -> None:
     args = parse_args()
     settings = get_settings()
     assets, interval = resolve_runtime_targets(args.assets, args.interval)
+    notifier = init_telegram_notifier(settings)
+    await notifier.start()
+    alert(
+        AlertCode.BOT_STARTED,
+        f"Bot online. Assets: {', '.join(assets)} | "
+        f"Mode: {'DRY RUN' if settings.runtime.dry_run else 'LIVE TRADING'}",
+        details={"version": getattr(settings, "bot_version", "?")},
+    )
     runtime = ApplicationRuntime(settings=settings, assets=assets, interval=interval)
 
     print(f"Starting trading agent: assets={assets}  interval={interval}")
@@ -144,7 +153,9 @@ async def main_async() -> None:
     try:
         await runtime.cycle_runner.run()
     finally:
+        await asyncio.sleep(3)
         await runtime.api_server.stop()
+        await notifier.stop()
 
 
 def main() -> None:

@@ -211,6 +211,20 @@ class Settings:
     risk: RiskSettings
     api: ApiSettings
     legacy: LegacySettings
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    bot_name: str = "HyperliquidBot"
+    bot_version: str = "1.0.0"
+    data_dir: str = "./data"
+    log_max_size_mb: int = 50
+
+    @property
+    def assets(self) -> list[str]:
+        return self.runtime.assets
+
+    @property
+    def dry_run(self) -> bool:
+        return self.runtime.dry_run
 
     @property
     def llm_provider(self) -> str:
@@ -282,6 +296,12 @@ class Settings:
                 "api_secret": self.api.secret,
                 "taapi_api_key": self.legacy.taapi_api_key,
                 "openrouter_api_key": self.legacy.openrouter_api_key,
+                "telegram_bot_token": self.telegram_bot_token,
+                "telegram_chat_id": self.telegram_chat_id,
+                "bot_name": self.bot_name,
+                "bot_version": self.bot_version,
+                "data_dir": self.data_dir,
+                "log_max_size_mb": self.log_max_size_mb,
             }
         )
 
@@ -459,6 +479,17 @@ def _load_settings() -> Settings:
             taapi_api_key=_get_env("TAAPI_API_KEY"),
             openrouter_api_key=_get_env("OPENROUTER_API_KEY"),
         ),
+        telegram_bot_token=_get_env("TELEGRAM_BOT_TOKEN"),
+        telegram_chat_id=_get_env("TELEGRAM_CHAT_ID"),
+        bot_name=_get_env("BOT_NAME", "HyperliquidBot") or "HyperliquidBot",
+        bot_version=_get_env("BOT_VERSION", "1.0.0") or "1.0.0",
+        data_dir=(
+            _get_env("DATA_DIR")
+            or _get_env("TRADING_DATA_DIR")
+            or _get_env("APP_DATA_DIR")
+            or "./data"
+        ),
+        log_max_size_mb=int(_get_int("LOG_MAX_SIZE_MB", 50) or 50),
     )
 
     if (

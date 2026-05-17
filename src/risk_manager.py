@@ -18,6 +18,7 @@ from typing import Any
 
 from src.config import Settings, get_settings
 from src.utils.state_persistence import load_risk_state, save_risk_state
+from src.utils.telegram_notifier import AlertCode, alert
 
 
 class RiskManager:
@@ -213,7 +214,19 @@ class RiskManager:
                 (self.daily_high_value - reference_value) / self.daily_high_value * 100
             )
             if drawdown_pct >= self.daily_loss_circuit_breaker_pct:
-                self.circuit_breaker_active = True
+                if not self.circuit_breaker_active:
+                    self.circuit_breaker_active = True
+                    alert(
+                        AlertCode.CIRCUIT_BREAKER_ACTIVATED,
+                        f"Daily circuit breaker ACTIVATED.\n"
+                        f"Drawdown: {drawdown_pct:.2f}% reached limit: {self.daily_loss_circuit_breaker_pct:.1f}%\n"
+                        f"New entries BLOCKED for today.",
+                        action_required="No action needed — bot is safe. Review losses.",
+                        details={
+                            "drawdown_pct": f"{drawdown_pct:.2f}%",
+                            "limit_pct": f"{self.daily_loss_circuit_breaker_pct:.1f}%",
+                        },
+                    )
                 self.circuit_breaker_date = datetime.now(timezone.utc).date()
                 self._persist_state()
                 return False, (
